@@ -1,0 +1,57 @@
+# =============================================================================
+# BRCloud FluxGate - CrowdSec Firewall Bouncer Configuration
+# =============================================================================
+# Le bouncer firewall recupere les decisions de CrowdSec (bans, captchas)
+# et alimente les blocklists du firewall local (nftables ou iptables).
+#
+# Installation :
+#   apt install crowdsec crowdsec-firewall-bouncer-nftables
+#   # ou pour iptables :
+#   apt install crowdsec crowdsec-firewall-bouncer-iptables
+#
+# Copier vers /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+# =============================================================================
+
+# --- Mode firewall ---
+# nftables (recommande) ou iptables
+mode: nftables
+
+# --- API CrowdSec locale ---
+api_url: http://127.0.0.1:8080/
+api_key: <CROWDSEC_BOUNCER_API_KEY>
+
+# --- Intervalle de mise a jour des decisions ---
+update_frequency: 10s
+
+# --- nftables : configuration des sets ---
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+    priority: -10
+  ipv6:
+    enabled: true
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain
+    priority: -10
+
+# --- Logging ---
+log_mode: file
+log_dir: /var/log/crowdsec/
+log_level: info
+log_max_size: 100
+log_max_age: 30
+log_max_backups: 3
+compress_logs: true
+
+# --- Blacklists initiales (optionnel) ---
+# blacklists: /etc/crowdsec/bouncers/blacklists.txt
+
+# --- Prometheus metrics (optionnel) ---
+prometheus:
+  enabled: true
+  listen_addr: 127.0.0.1
+  listen_port: 60601

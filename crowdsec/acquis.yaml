@@ -1,0 +1,43 @@
+# =============================================================================
+# BRCloud FluxGate - CrowdSec Acquisition Configuration
+# =============================================================================
+# Definit les sources de logs que CrowdSec doit analyser.
+# Copier vers /etc/crowdsec/acquis.yaml (ou /etc/crowdsec/acquis.d/)
+# =============================================================================
+
+# --- Logs SSH / auth ---
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+labels:
+  type: syslog
+---
+
+# --- Logs NGINX ---
+filenames:
+  - /var/log/nginx/access.log
+  - /var/log/nginx/error.log
+labels:
+  type: nginx
+---
+
+# --- Logs Apache (si utilise a la place de NGINX) ---
+filenames:
+  - /var/log/apache2/access-timing.log
+  - /var/log/apache2/error.log
+labels:
+  type: apache2
+---
+
+# --- Logs nftables (si logging active) ---
+filenames:
+  - /var/log/nftables.log
+labels:
+  type: nftables
+---
+
+# --- Logs ModSecurity (si WAF active) ---
+filenames:
+  - /var/log/modsecurity/modsec_audit.log
+labels:
+  type: modsecurity

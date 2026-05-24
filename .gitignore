@@ -1,0 +1,12 @@
+# Configuration locale (contient des valeurs specifiques au serveur)
+scripts/config.env
+
+# Logs
+*.log
+
+# Backups
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db

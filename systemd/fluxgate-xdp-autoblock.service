@@ -1,0 +1,36 @@
+# =============================================================================
+# BRCloud FluxGate - XDP Auto-Block Daemon
+# =============================================================================
+# Service systemd pour le script de blocage automatique XDP.
+# Copier vers /etc/systemd/system/fluxgate-xdp-autoblock.service
+# =============================================================================
+
+[Unit]
+Description=BRCloud FluxGate - XDP Auto-Block Daemon
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/fluxgate/xdp/xdp-auto-block.sh
+
+[Service]
+Type=simple
+ExecStart=/opt/fluxgate/xdp/xdp-auto-block.sh
+Restart=on-failure
+RestartSec=10s
+
+# Resource limits pour le daemon lui-meme
+CPUQuota=10%
+MemoryMax=256M
+LimitNOFILE=1024
+
+# Securite
+NoNewPrivileges=false
+ProtectHome=true
+PrivateTmp=true
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fluxgate-xdp
+
+[Install]
+WantedBy=multi-user.target

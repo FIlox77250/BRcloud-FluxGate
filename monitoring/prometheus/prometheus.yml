@@ -1,0 +1,49 @@
+# =============================================================================
+# BRCloud FluxGate - Prometheus Configuration
+# =============================================================================
+# Collecte des metriques du serveur pour supervision anti-DDoS.
+# Copier vers /etc/prometheus/prometheus.yml
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+# --- Regles d'alerte ---
+rule_files:
+  - "/etc/prometheus/rules/fluxgate-alerts.yml"
+
+# --- Scrape targets ---
+scrape_configs:
+
+  # --- Prometheus self-monitoring ---
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  # --- Node Exporter (metriques systeme : CPU, RAM, reseau, FD) ---
+  - job_name: "node"
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "fluxgate-host"
+
+  # --- NGINX stub_status (si NGINX utilise) ---
+  # Necessite nginx-prometheus-exporter ou parsing stub_status
+  # - job_name: "nginx"
+  #   static_configs:
+  #     - targets: ["127.0.0.1:9113"]
+
+  # --- CrowdSec Prometheus metrics (si active) ---
+  - job_name: "crowdsec-bouncer"
+    static_configs:
+      - targets: ["127.0.0.1:60601"]
+
+  # --- Application custom metrics (si expose) ---
+  # - job_name: "app"
+  #   static_configs:
+  #     - targets: ["127.0.0.1:8080"]
+  #   metrics_path: "/metrics"

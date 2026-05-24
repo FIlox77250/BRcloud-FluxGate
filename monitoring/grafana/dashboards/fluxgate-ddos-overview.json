@@ -1,0 +1,216 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "BRCloud FluxGate - Vue d'ensemble anti-DDoS",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Paquets RX/TX par seconde",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_packets_total{device!=\"lo\"}[1m])",
+          "legendFormat": "RX pps ({{device}})"
+        },
+        {
+          "expr": "rate(node_network_transmit_packets_total{device!=\"lo\"}[1m])",
+          "legendFormat": "TX pps ({{device}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "title": "Bande passante RX/TX",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_bytes_total{device!=\"lo\"}[1m]) * 8",
+          "legendFormat": "RX bps ({{device}})"
+        },
+        {
+          "expr": "rate(node_network_transmit_bytes_total{device!=\"lo\"}[1m]) * 8",
+          "legendFormat": "TX bps ({{device}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps"
+        }
+      }
+    },
+    {
+      "title": "Drops RX/TX",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_drop_total{device!=\"lo\"}[1m])",
+          "legendFormat": "RX drops/s ({{device}})"
+        },
+        {
+          "expr": "rate(node_network_transmit_drop_total{device!=\"lo\"}[1m])",
+          "legendFormat": "TX drops/s ({{device}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Conntrack Entries vs Max",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "node_nf_conntrack_entries",
+          "legendFormat": "Entries actuelles"
+        },
+        {
+          "expr": "node_nf_conntrack_entries_limit",
+          "legendFormat": "Limite max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "CPU par mode",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "avg(rate(node_cpu_seconds_total{mode=\"softirq\"}[5m])) * 100",
+          "legendFormat": "softirq %"
+        },
+        {
+          "expr": "avg(rate(node_cpu_seconds_total{mode=\"system\"}[5m])) * 100",
+          "legendFormat": "system %"
+        },
+        {
+          "expr": "avg(rate(node_cpu_seconds_total{mode=\"user\"}[5m])) * 100",
+          "legendFormat": "user %"
+        },
+        {
+          "expr": "avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100",
+          "legendFormat": "idle %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100
+        }
+      }
+    },
+    {
+      "title": "Memoire",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100",
+          "legendFormat": "Utilisation %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "File Descriptors",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "targets": [
+        {
+          "expr": "node_filefd_allocated / node_filefd_maximum * 100",
+          "legendFormat": "FD usage %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "yellow", "value": 60 },
+              { "color": "red", "value": 80 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Sockets TCP par etat",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "node_sockstat_TCP_alloc",
+          "legendFormat": "TCP allocated"
+        },
+        {
+          "expr": "node_sockstat_TCP_tw",
+          "legendFormat": "TIME_WAIT"
+        },
+        {
+          "expr": "node_sockstat_TCP_inuse",
+          "legendFormat": "TCP in use"
+        }
+      ]
+    },
+    {
+      "title": "Erreurs reseau",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_errs_total{device!=\"lo\"}[5m])",
+          "legendFormat": "RX errors/s ({{device}})"
+        },
+        {
+          "expr": "rate(node_network_transmit_errs_total{device!=\"lo\"}[5m])",
+          "legendFormat": "TX errors/s ({{device}})"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["fluxgate", "ddos", "network", "security"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "title": "BRCloud FluxGate - DDoS Overview",
+  "uid": "fluxgate-ddos-overview"
+}

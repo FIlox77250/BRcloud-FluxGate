@@ -1,0 +1,20 @@
+# =============================================================================
+# BRCloud FluxGate - Grafana Dashboard Provisioning
+# =============================================================================
+# Copier vers /etc/grafana/provisioning/dashboards/fluxgate.yml
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: "BRCloud FluxGate"
+    orgId: 1
+    folder: "FluxGate"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/fluxgate
+      foldersFromFilesStructure: false

@@ -1,0 +1,41 @@
+# =============================================================================
+# BRCloud FluxGate - systemd Socket Activation avec limites
+# =============================================================================
+# Socket systemd avec limitation de connexions par IP source.
+# Utile pour les services qui supportent l'activation par socket.
+#
+# Installation :
+#   cp fluxgate-app.socket /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now fluxgate-app.socket
+# =============================================================================
+
+[Unit]
+Description=BRCloud FluxGate - Socket avec limites anti-DDoS
+Documentation=man:systemd.socket(5)
+
+[Socket]
+# Port d'ecoute (adapter)
+ListenStream=8080
+
+# Limiter le nombre de connexions simultanees par IP source
+MaxConnectionsPerSource=50
+
+# Backlog TCP (file d'attente des connexions en attente d'accept)
+Backlog=4096
+
+# Nombre max de connexions totales en attente
+MaxConnections=1024
+
+# Activer keep-alive au niveau socket
+KeepAlive=true
+KeepAliveTimeSec=60
+
+# Ne pas delayer les petits paquets
+NoDelay=true
+
+# Demarrer le service associe (meme nom sans .socket -> .service)
+Accept=no
+
+[Install]
+WantedBy=sockets.target

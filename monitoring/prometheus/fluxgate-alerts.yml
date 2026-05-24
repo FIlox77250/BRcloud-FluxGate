@@ -1,0 +1,132 @@
+# =============================================================================
+# BRCloud FluxGate - Prometheus Alert Rules
+# =============================================================================
+# Regles d'alerte pour detecter les signes d'attaque DDoS.
+# Copier vers /etc/prometheus/rules/fluxgate-alerts.yml
+# =============================================================================
+
+groups:
+  - name: fluxgate_ddos_alerts
+    rules:
+
+      # --- CPU softirq eleve (signe de flood reseau) ---
+      - alert: HighSoftIRQ
+        expr: rate(node_cpu_seconds_total{mode="softirq"}[5m]) > 0.3
+        for: 2m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "CPU softirq eleve ({{ $value | printf \"%.2f\" }})"
+          description: "Le temps CPU passe en softirq depasse 30%, signe possible d'un flood reseau."
+
+      # --- Taux de paquets RX eleve ---
+      - alert: HighPacketRate
+        expr: rate(node_network_receive_packets_total{device!="lo"}[2m]) > 100000
+        for: 2m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "Taux de paquets RX eleve ({{ $value | printf \"%.0f\" }} pps)"
+          description: "Plus de 100k paquets/sec recus sur l'interface reseau."
+
+      # --- Drops reseau RX ---
+      - alert: NetworkRXDrops
+        expr: rate(node_network_receive_drop_total{device!="lo"}[5m]) > 100
+        for: 1m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "Drops RX reseau ({{ $value | printf \"%.0f\" }}/sec)"
+          description: "Des paquets sont droppes a la reception, file RX potentiellement saturee."
+
+      # --- Conntrack proche du max ---
+      - alert: ConntrackNearMax
+        expr: node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.8
+        for: 1m
+        labels:
+          severity: critical
+          category: ddos
+        annotations:
+          summary: "Conntrack a {{ $value | printf \"%.0f\" }}% de la limite"
+          description: "La table conntrack approche de sa limite. Risque de drop de nouvelles connexions."
+
+      # --- File descriptors proches du max ---
+      - alert: FileDescriptorsHigh
+        expr: node_filefd_allocated / node_filefd_maximum > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "File descriptors a {{ $value | printf \"%.0f\" }}%"
+          description: "Nombre de FD alloues proche du maximum systeme."
+
+      # --- Memoire faible ---
+      - alert: MemoryLow
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.1
+        for: 2m
+        labels:
+          severity: critical
+          category: resources
+        annotations:
+          summary: "Memoire disponible < 10%"
+          description: "Memoire disponible critique, risque d'OOM."
+
+      # --- CPU eleve global ---
+      - alert: HighCPUUsage
+        expr: 100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 5m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "CPU usage > 90%"
+          description: "Utilisation CPU globale superieure a 90% depuis 5 minutes."
+
+      # --- TCP TIME_WAIT eleve (signe de flood ou connexions courtes massives) ---
+      - alert: HighTimeWait
+        expr: node_sockstat_TCP_tw > 10000
+        for: 2m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "Nombre eleve de sockets TIME_WAIT ({{ $value }})"
+          description: "Nombre anormalement eleve de sockets en TIME_WAIT, signe possible de flood ou de connexions courtes massives."
+
+      # --- Bande passante entrante elevee ---
+      - alert: HighInboundBandwidth
+        expr: rate(node_network_receive_bytes_total{device!="lo"}[2m]) * 8 > 800000000
+        for: 2m
+        labels:
+          severity: critical
+          category: ddos
+        annotations:
+          summary: "Bande passante entrante > 800 Mbps"
+          description: "Trafic entrant potentiellement saturant. Verifier si attaque volumetrique."
+
+  - name: fluxgate_service_alerts
+    rules:
+
+      # --- Service down ---
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Service {{ $labels.job }} down"
+          description: "Le target {{ $labels.instance }} du job {{ $labels.job }} est injoignable."
+
+      # --- Taux d'erreurs HTTP eleve (si metrics dispo) ---
+      # - alert: HighHTTPErrorRate
+      #   expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+      #   for: 2m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "Taux d'erreurs HTTP 5xx > 5%"
