@@ -349,7 +349,7 @@ if command -v nginx &>/dev/null; then
         if [[ ! -d /etc/modsecurity/crs/rules ]] || [[ -z "$(ls -A /etc/modsecurity/crs/rules 2>/dev/null)" ]]; then
             log_warn "Regles OWASP CRS manquantes dans /etc/modsecurity/crs/rules. Telechargement..."
             mkdir -p /etc/modsecurity/crs
-            local temp_tar="/tmp/crs.tar.gz"
+            temp_tar="/tmp/crs.tar.gz"
             if command -v curl &>/dev/null; then
                 curl -sL -o "$temp_tar" "https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.0.0.tar.gz" || true
             elif command -v wget &>/dev/null; then
