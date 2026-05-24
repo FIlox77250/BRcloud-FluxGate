@@ -344,6 +344,29 @@ if command -v nginx &>/dev/null; then
     if [[ -f /usr/lib/nginx/modules/ngx_http_modsecurity_module.so ]] || \
        dpkg -l libnginx-mod-http-modsecurity 2>/dev/null | grep -q "^ii"; then
         log_info "ModSecurity detecte. Activation WAF..."
+        
+        # --- Assurer la presence des regles OWASP CRS ---
+        if [[ ! -d /etc/modsecurity/crs/rules ]] || [[ -z "$(ls -A /etc/modsecurity/crs/rules 2>/dev/null)" ]]; then
+            log_warn "Regles OWASP CRS manquantes dans /etc/modsecurity/crs/rules. Telechargement..."
+            mkdir -p /etc/modsecurity/crs
+            local temp_tar="/tmp/crs.tar.gz"
+            if command -v curl &>/dev/null; then
+                curl -sL -o "$temp_tar" "https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.0.0.tar.gz" || true
+            elif command -v wget &>/dev/null; then
+                wget -q -O "$temp_tar" "https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.0.0.tar.gz" || true
+            fi
+            if [[ -f "$temp_tar" ]]; then
+                tar xz --strip-components=1 -C /etc/modsecurity/crs -f "$temp_tar" 2>/dev/null || true
+                rm -f "$temp_tar"
+                if [[ -f /etc/modsecurity/crs/crs-setup.conf.example ]] && [[ ! -f /etc/modsecurity/crs/crs-setup.conf ]]; then
+                    cp /etc/modsecurity/crs/crs-setup.conf.example /etc/modsecurity/crs/crs-setup.conf
+                fi
+                log_info "OWASP CRS telecharge et installe avec succes."
+            else
+                log_error "Echec du telechargement de OWASP CRS."
+            fi
+        fi
+
         # Copier configs WAF
         mkdir -p /etc/modsecurity /etc/modsecurity/crs
         cp "$INSTALL_DIR/waf/modsecurity/modsecurity.conf" /etc/modsecurity/ 2>/dev/null || true

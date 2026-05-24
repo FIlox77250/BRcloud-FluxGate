@@ -531,7 +531,7 @@ if [[ "$INSTALL_WAF" == "true" ]]; then
     # Telecharger OWASP CRS v4
     CRS_VERSION="4.0.0"
     CRS_DIR="/etc/modsecurity/crs"
-    if [[ ! -d "$CRS_DIR" ]]; then
+    if [[ ! -d "$CRS_DIR/rules" ]]; then
         log_info "Telechargement OWASP CRS v${CRS_VERSION}..."
         mkdir -p "$CRS_DIR"
         curl -sL "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VERSION}.tar.gz" \
