@@ -193,8 +193,8 @@ if command -v nft &>/dev/null; then
         log_warn "'at' non disponible. Pas de rollback automatique programme."
     fi
 
-    # Appliquer les nouvelles regles
-    nft -f "$NFTCONF"
+    # Appliquer les nouvelles regles et charger le service
+    systemctl restart nftables 2>/dev/null || nft -f "$NFTCONF"
 
     # Tester la connectivite (attendre 3 sec, verifier qu'on a toujours le controle)
     sleep 3
@@ -204,7 +204,7 @@ if command -v nft &>/dev/null; then
     fi
 
     systemctl enable nftables 2>/dev/null || true
-    log_info "nftables configure et actif."
+    log_info "nftables configure, demarre et actif."
 else
     log_warn "nft non trouve. nftables non deploye."
 fi
@@ -377,16 +377,37 @@ if command -v fail2ban-client &>/dev/null; then
         backup_file "/etc/fail2ban/filter.d/$(basename "$f")"
     done
     
-    cp "$INSTALL_DIR/fail2ban/jail.d/"*.conf /etc/fail2ban/jail.d/
     cp "$INSTALL_DIR/fail2ban/filter.d/"*.conf /etc/fail2ban/filter.d/
+
+    # Copier SSH jail (toujours actif)
+    cp "$INSTALL_DIR/fail2ban/jail.d/fluxgate-sshd.conf" /etc/fail2ban/jail.d/
+
+    # Copier NGINX jail uniquement si NGINX est installe
+    if command -v nginx &>/dev/null; then
+        cp "$INSTALL_DIR/fail2ban/jail.d/fluxgate-nginx.conf" /etc/fail2ban/jail.d/
+        mkdir -p /var/log/nginx
+        touch /var/log/nginx/access.log /var/log/nginx/error.log
+    else
+        rm -f /etc/fail2ban/jail.d/fluxgate-nginx.conf
+    fi
+
+    # Copier Apache jail uniquement si Apache est installe
+    if command -v apachectl &>/dev/null || command -v httpd &>/dev/null; then
+        cp "$INSTALL_DIR/fail2ban/jail.d/fluxgate-apache.conf" /etc/fail2ban/jail.d/
+        mkdir -p /var/log/apache2
+        touch /var/log/apache2/access-timing.log /var/log/apache2/error.log
+    else
+        rm -f /etc/fail2ban/jail.d/fluxgate-apache.conf
+    fi
 
     # Adapter les valeurs SSH (match par cle, pas par valeur)
     sed -i "s/^maxretry = .*/maxretry = ${F2B_SSH_MAXRETRY}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
     sed -i "s/^findtime = .*/findtime = ${F2B_SSH_FINDTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
     sed -i "s/^bantime  = .*/bantime  = ${F2B_SSH_BANTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
 
+    systemctl enable fail2ban 2>/dev/null || true
     systemctl restart fail2ban
-    log_info "fail2ban configure et redemarre."
+    log_info "fail2ban configure, active et redemarre."
 else
     log_warn "fail2ban non installe."
 fi
