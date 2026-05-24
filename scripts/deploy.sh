@@ -130,25 +130,66 @@ if command -v nft &>/dev/null; then
     sed -i "s/^define HTTP_PORT  = .*/define HTTP_PORT  = ${HTTP_PORT}/" "$NFTCONF"
     sed -i "s/^define HTTPS_PORT = .*/define HTTPS_PORT = ${HTTPS_PORT}/" "$NFTCONF"
 
-    # --- Securite anti-lockout SSH ---
-    if [[ -n "${SSH_CLIENT:-}" ]] || [[ -n "${SSH_CONNECTION:-}" ]]; then
-        SSH_IP=$(echo "${SSH_CLIENT:-$SSH_CONNECTION}" | awk '{print $1}')
+    # --- Securite anti-lockout SSH interactive ---
+    echo ""
+    echo -e "${CYAN}=============================================${NC}"
+    echo -e "      Securisation de l'acces SSH (Port ${SSH_PORT})"
+    echo -e "${CYAN}=============================================${NC}"
+    echo ""
+    
+    SSH_MODE="open"
+    if [[ "$HAS_GUM" == "true" ]]; then
+        SSH_CHOICE=$(gum choose "1. Ouvert a tous (avec rate-limiting et protection Fail2ban - Recommande)" "2. Strict (Restreint uniquement a ADMIN_NETS et votre IP active)")
+        if [[ "$SSH_CHOICE" == *"Strict"* ]]; then
+            SSH_MODE="strict"
+        fi
+    else
+        echo "Comment voulez-vous securiser l'acces SSH ?"
+        echo "  1) Ouvert a tous avec rate-limiting et Fail2ban (Recommande, 0% risque lockout)"
+        echo "  2) Restreint aux IP de confiance uniquement (Strict, ADMIN_NETS)"
+        echo ""
+        read -rp "Votre choix [1/2] (defaut: 1) : " ssh_choice_input
+        if [[ "${ssh_choice_input:-1}" == "2" ]]; then
+            SSH_MODE="strict"
+        fi
+    fi
+
+    if [[ "$SSH_MODE" == "open" ]]; then
+        log_info "Option choisie : SSH ouvert a tous avec protections. Desactivation de la restriction ADMIN_NETS."
+        # Commenter la ligne restrictive ADMIN_NETS dans nftables.conf
+        sed -i 's/^[[:space:]]*tcp dport \$SSH_PORT ip saddr \$ADMIN_NETS/# tcp dport \$SSH_PORT ip saddr \$ADMIN_NETS/' "$NFTCONF"
+    else
+        log_info "Option choisie : Acces SSH strict (restreint a ADMIN_NETS)."
+        # --- Securite anti-lockout SSH ---
+        # Determiner l'IP de connexion active
+        SSH_IP=""
+        if [[ -n "${SSH_CLIENT:-}" ]] || [[ -n "${SSH_CONNECTION:-}" ]]; then
+            SSH_IP=$(echo "${SSH_CLIENT:-$SSH_CONNECTION}" | awk '{print $1}')
+        fi
+        
+        # Si non detectee automatiquement (a cause de sudo -i), demander a l'utilisateur
+        if [[ -z "$SSH_IP" ]]; then
+            log_warn "Impossible de detecter automatiquement votre IP active (variable vide)."
+            if [[ "$HAS_GUM" == "true" ]]; then
+                SSH_IP=$(gum input --placeholder "Veuillez saisir votre IP publique actuelle pour l'ajouter a la whitelist (ex: 203.0.113.50, laisser vide pour ignorer) : ")
+            else
+                read -rp "Veuillez saisir manuellement votre IP publique active pour l'ajouter a la whitelist (ex: 203.0.113.50, laisser vide pour ignorer) : " SSH_IP
+            fi
+        fi
+        
         if [[ -n "$SSH_IP" ]]; then
-            log_info "Connexion active de l'administrateur depuis : $SSH_IP"
-            
-            # Extraire le contenu entre les accolades de define ADMIN_NETS
+            log_info "IP de l'administrateur a verifier : $SSH_IP"
+            # Extraire le contenu de ADMIN_NETS
             NETS_CONTENT=$(grep -E '^[[:space:]]*define ADMIN_NETS[[:space:]]*=' "$NFTCONF" | grep -oP '\{\K[^\}]+' | sed 's/,/ /g' || echo "")
             
             IS_WHITELISTED=false
             if [[ -n "$NETS_CONTENT" ]]; then
-                # Utiliser Python pour valider l'appartenance CIDR
                 if command -v python3 &>/dev/null; then
                     PY_NETS=$(echo "$NETS_CONTENT" | awk '{for(i=1;i<=NF;i++) printf "\"%s\", ", $i}')
                     if python3 -c "import ipaddress; ip = ipaddress.ip_address('$SSH_IP'); nets = [$PY_NETS]; print('TRUE' if any(ip in ipaddress.ip_network(n.strip()) for n in nets if n.strip()) else 'FALSE')" 2>/dev/null | grep -q "TRUE"; then
                         IS_WHITELISTED=true
                     fi
                 else
-                    # Fallback simple si Python est absent
                     for net in $NETS_CONTENT; do
                         if [[ "$SSH_IP" == "${net%/32}" ]] || [[ "$SSH_IP" == ${net%.*}* ]]; then
                             IS_WHITELISTED=true
@@ -159,20 +200,25 @@ if command -v nft &>/dev/null; then
             fi
 
             if [[ "$IS_WHITELISTED" == "false" ]]; then
-                log_warn "Votre IP SSH active ($SSH_IP) n'est PAS whitelistee dans ADMIN_NETS dans nftables.conf."
-                log_warn "ADMIN_NETS contient actuellement : { $NETS_CONTENT }"
-                echo -e "${YELLOW}!!! RISQUE DE LOCKOUT SSH !!!${NC}"
-                read -rp "Voulez-vous ajouter dynamiquement votre IP ($SSH_IP/32) a la whitelist ? (Y/n) " add_ip
-                if [[ "${add_ip:-y}" =~ ^[yY]$ ]]; then
-                    sed -i "s/define ADMIN_NETS[[:space:]]*=[[:space:]]*{[[:space:]]*/define ADMIN_NETS = { ${SSH_IP}\/32, /" "$NFTCONF"
-                    log_info "IP $SSH_IP/32 ajoutee dynamiquement a ADMIN_NETS dans $NFTCONF."
+                log_warn "Votre IP ($SSH_IP) n'est pas whitelistee dans ADMIN_NETS."
+                if [[ "$HAS_GUM" == "true" ]]; then
+                    gum confirm "Voulez-vous ajouter dynamiquement votre IP ($SSH_IP/32) a la whitelist ?" --default=true && {
+                        sed -i "s/define ADMIN_NETS[[:space:]]*=[[:space:]]*{[[:space:]]*/define ADMIN_NETS = { ${SSH_IP}\/32, /" "$NFTCONF"
+                        log_info "IP $SSH_IP/32 ajoutee dynamiquement a ADMIN_NETS dans $NFTCONF."
+                    } || log_warn "IP non ajoutee."
                 else
-                    log_warn "Continuer sans Whitelister votre IP active peut couper votre connexion SSH."
-                    read -rp "Etes-vous sur de vouloir continuer le deploiement ? (y/N) " force_continue
-                    [[ "$force_continue" =~ ^[yY]$ ]] || { log_info "Deploiement annule."; exit 0; }
+                    read -rp "Voulez-vous ajouter dynamiquement votre IP ($SSH_IP/32) a la whitelist ? (Y/n) " add_ip
+                    if [[ "${add_ip:-y}" =~ ^[yY]$ ]]; then
+                        sed -i "s/define ADMIN_NETS[[:space:]]*=[[:space:]]*{[[:space:]]*/define ADMIN_NETS = { ${SSH_IP}\/32, /" "$NFTCONF"
+                        log_info "IP $SSH_IP/32 ajoutee dynamiquement a ADMIN_NETS dans $NFTCONF."
+                    else
+                        log_warn "Continuer sans whitelister votre IP active peut couper votre connexion SSH."
+                        read -rp "Etes-vous sur de vouloir continuer le deploiement ? (y/N) " force_continue
+                        [[ "$force_continue" =~ ^[yY]$ ]] || { log_info "Deploiement annule."; exit 0; }
+                    fi
                 fi
             else
-                log_info "Votre IP SSH active ($SSH_IP) est correctement whitelistee dans ADMIN_NETS."
+                log_info "Votre IP active ($SSH_IP) est deja whitelistee dans ADMIN_NETS."
             fi
         fi
     fi
