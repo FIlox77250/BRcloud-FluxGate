@@ -193,8 +193,28 @@ if command -v nft &>/dev/null; then
         log_warn "'at' non disponible. Pas de rollback automatique programme."
     fi
 
+    # Tester la syntaxe de nftables avant d'appliquer
+    log_info "Verification de la syntaxe nftables..."
+    if nft -c -f "$NFTCONF" 2>/dev/null; then
+        log_info "Syntaxe nftables valide."
+    else
+        log_warn "Erreur de syntaxe detectee dans nftables.conf !"
+        nft -c -f "$NFTCONF" || true
+    fi
+
     # Appliquer les nouvelles regles et charger le service
-    systemctl restart nftables 2>/dev/null || nft -f "$NFTCONF"
+    log_info "Redemarrage du service nftables..."
+    if systemctl restart nftables 2>/dev/null; then
+        log_info "Service nftables redemarre avec succes."
+    else
+        log_error "Echec du redemarrage du service nftables !"
+        log_info "=== Logs recents de nftables ==="
+        journalctl -n 20 -u nftables --no-pager || true
+        log_info "=== Statut de nftables ==="
+        systemctl status nftables --no-pager || true
+        log_info "Tentative d'application directe des regles en memoire..."
+        nft -f "$NFTCONF" || true
+    fi
 
     # Tester la connectivite (attendre 3 sec, verifier qu'on a toujours le controle)
     sleep 3
@@ -405,9 +425,19 @@ if command -v fail2ban-client &>/dev/null; then
     sed -i "s/^findtime = .*/findtime = ${F2B_SSH_FINDTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
     sed -i "s/^bantime  = .*/bantime  = ${F2B_SSH_BANTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
 
+    log_info "Redemarrage du service fail2ban..."
     systemctl enable fail2ban 2>/dev/null || true
-    systemctl restart fail2ban
-    log_info "fail2ban configure, active et redemarre."
+    if systemctl restart fail2ban 2>/dev/null; then
+        log_info "Service fail2ban configure, active et redemarre avec succes."
+    else
+        log_error "Echec du redemarrage du service fail2ban !"
+        log_info "=== Logs recents de fail2ban ==="
+        journalctl -n 20 -u fail2ban --no-pager || true
+        log_info "=== Statut de fail2ban ==="
+        systemctl status fail2ban --no-pager || true
+        log_info "=== Logs internes de fail2ban (/var/log/fail2ban.log) ==="
+        tail -n 20 /var/log/fail2ban.log 2>/dev/null || true
+    fi
 else
     log_warn "fail2ban non installe."
 fi
