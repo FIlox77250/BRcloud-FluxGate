@@ -49,7 +49,7 @@ nano scripts/config.env
 ```
 
 > ⚠️ **À adapter impérativement :**
-> - `IFACE` — interface réseau publique (ex : `eth0`, `ens3`, `enp1s0`)
+> - `IFACE` — interface réseau publique (ex : `eth0`, `ens33`, `enp1s0`)
 > - `SSH_PORT` — port SSH actuel (critique pour éviter le lockout)
 
 ### 3. Installer les dépendances
