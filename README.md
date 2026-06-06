@@ -152,7 +152,31 @@ BRcloud-FluxGate/
 └── sysctl/
     └── 99-fluxgate-hardening.conf
 ```
+## Utilisation avec un reverse proxy (Caddy, Nginx, Traefik…)
 
+Si tu utilises un reverse proxy comme Caddy sur le même hôte, les ports 80 et 443
+doivent être explicitement autorisés dans nftables — FluxGate applique un `policy drop`
+par défaut sur toutes les entrées.
+
+La config `nftables/nftables.conf` inclut déjà les règles HTTP/HTTPS, mais si tu
+constates que le reverse proxy ne répond pas après déploiement, c'est probablement
+que l'ancienne config `/etc/nftables.conf` n'a pas été mise à jour.
+
+**Solution :**
+
+```bash
+sudo cp ~/BRcloud-FluxGate/nftables/nftables.conf /etc/nftables.conf
+sudo nft -f /etc/nftables.conf
+
+# Vérifier que les ports sont bien ouverts
+sudo nft list ruleset | grep -E "80|443"
+
+# Persister au reboot
+sudo systemctl enable nftables
+```
+
+> ⚠️ Ne pas oublier d'activer `systemctl enable nftables` pour que les règles
+> survivent à un redémarrage du serveur.
 ---
 
 ## Licence & références
