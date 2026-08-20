@@ -59,6 +59,27 @@ val=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "N/A")
 val=$(sysctl -n net.ipv4.icmp_echo_ignore_broadcasts 2>/dev/null || echo "N/A")
 [[ "$val" == "1" ]] && check_pass "ICMP broadcast ignore actif" || check_warn "icmp_echo_ignore_broadcasts = $val"
 
+# --- Controle de congestion ---
+val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+case "$val" in
+    bbr)   check_pass "Controle de congestion : bbr" ;;
+    cubic) check_warn "Controle de congestion : cubic (bbr indisponible ou non applique)" ;;
+    *)     check_warn "Controle de congestion : $val" ;;
+esac
+
+val=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
+[[ "$val" == "fq" ]] && check_pass "Qdisc par defaut : fq" || check_warn "Qdisc par defaut : $val (fq recommande avec bbr)"
+
+# --- Prerequis SYNPROXY ---
+val=$(sysctl -n net.netfilter.nf_conntrack_tcp_loose 2>/dev/null || echo "N/A")
+if [[ "$val" == "0" ]]; then
+    check_pass "nf_conntrack_tcp_loose = 0 (prerequis SYNPROXY satisfait)"
+elif [[ "$val" == "N/A" ]]; then
+    check_warn "nf_conntrack non charge : impossible de verifier tcp_loose"
+else
+    check_warn "nf_conntrack_tcp_loose = $val (doit valoir 0 si SYNPROXY est utilise)"
+fi
+
 echo ""
 
 # =============================================================================
@@ -78,8 +99,45 @@ if command -v nft &>/dev/null; then
 
         nft list ruleset 2>/dev/null | grep -q "limit rate" && \
             check_pass "Rate limiting present" || check_warn "Pas de rate limiting nftables"
+
+        # Parite IPv6 : un pare-feu qui ne filtre qu'en IPv4 laisse une porte
+        # ouverte des que la machine a une adresse IPv6 routable.
+        nft list ruleset 2>/dev/null | grep -q "blocklist6" && \
+            check_pass "Set blocklist6 present (parite IPv6)" || check_warn "Set blocklist6 absent"
+
+        if ip -6 addr show scope global 2>/dev/null | grep -q "inet6"; then
+            check_info "IPv6 globale detectee sur cette machine"
+            nft list ruleset 2>/dev/null | grep -q "ip6 saddr" && \
+                check_pass "Regles IPv6 presentes dans le ruleset" || \
+                check_fail "IPv6 active mais aucune regle ip6 saddr : trafic IPv6 non filtre"
+        fi
+
+        # SYNPROXY : les deux moities doivent etre presentes ou aucune.
+        HAS_SYNPROXY_PRE=$(nft list ruleset 2>/dev/null | grep -c "notrack" || true)
+        HAS_SYNPROXY_IN=$(nft list ruleset 2>/dev/null | grep -c "synproxy" || true)
+        if [[ "$HAS_SYNPROXY_IN" -gt 0 ]] && [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
+            check_pass "SYNPROXY actif (prerouting notrack + regle input)"
+        elif [[ "$HAS_SYNPROXY_IN" -gt 0 ]] || [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
+            check_fail "SYNPROXY incomplet : notrack=$HAS_SYNPROXY_PRE, synproxy=$HAS_SYNPROXY_IN (le trafic web sera casse)"
+        else
+            check_info "SYNPROXY non active"
+        fi
+
+        # Un ruleset sans regle SSH d'aucune sorte = lockout au prochain reboot
+        if nft list ruleset 2>/dev/null | grep -q "dport ${SSH_PORT:-22}"; then
+            check_pass "Regle SSH presente pour le port ${SSH_PORT:-22}"
+        else
+            check_fail "Aucune regle nftables pour le port SSH ${SSH_PORT:-22} !"
+        fi
     else
         check_fail "nftables sans regles input"
+    fi
+
+    # Les regles doivent survivre au reboot
+    if systemctl is-enabled nftables &>/dev/null; then
+        check_pass "Service nftables active au demarrage"
+    else
+        check_fail "nftables non active au boot : les regles seront perdues au reboot"
     fi
 else
     check_warn "nft non disponible"
@@ -156,6 +214,57 @@ if command -v fail2ban-client &>/dev/null; then
     else
         check_warn "Aucune jail fail2ban active"
     fi
+
+    # Action FluxGate : les bans doivent atterrir dans blocklist4/6
+    if grep -rq "banaction = fluxgate-nft" /etc/fail2ban/jail.d/ 2>/dev/null; then
+        if [[ -f /etc/fail2ban/action.d/fluxgate-nft.conf ]]; then
+            check_pass "fail2ban banni dans les sets FluxGate (blocklist4/6)"
+        else
+            check_fail "Jails configurees sur fluxgate-nft mais action.d/fluxgate-nft.conf absent : les bans echoueront"
+        fi
+    else
+        check_info "fail2ban utilise l'action nftables standard (table f2b dediee)"
+    fi
+fi
+
+echo ""
+
+# =============================================================================
+# 6b. WAF / OWASP CRS
+# =============================================================================
+echo "--- WAF ModSecurity / OWASP CRS ---"
+
+if [[ -d /etc/modsecurity/crs/rules ]]; then
+    nb_rules=$(find /etc/modsecurity/crs/rules -name "*.conf" 2>/dev/null | wc -l)
+    if [[ "$nb_rules" -gt 0 ]]; then
+        check_pass "OWASP CRS present ($nb_rules fichiers de regles)"
+    else
+        check_fail "Repertoire CRS present mais vide : WAF sans regles"
+    fi
+
+    # Version reellement installee vs version attendue
+    if [[ -f /etc/modsecurity/crs/crs-setup.conf.example ]] || [[ -f /etc/modsecurity/crs/crs-setup.conf ]]; then
+        installed_ver=$(grep -rhoP 'version[/ ]OWASP_CRS/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/modsecurity/crs/rules/*.conf 2>/dev/null | head -1)
+        if [[ -n "$installed_ver" ]]; then
+            if [[ -n "${CRS_VERSION:-}" ]] && [[ "$installed_ver" != "${CRS_VERSION}" ]]; then
+                check_warn "CRS installe en v${installed_ver}, config.env attend v${CRS_VERSION}"
+            else
+                check_pass "OWASP CRS v${installed_ver}"
+            fi
+        fi
+    fi
+
+    if [[ ! -f /etc/modsecurity/unicode.mapping ]]; then
+        if grep -q "^[[:space:]]*SecUnicodeMapFile" /etc/modsecurity/modsecurity.conf 2>/dev/null; then
+            check_fail "SecUnicodeMapFile actif mais unicode.mapping absent : NGINX refusera de demarrer"
+        else
+            check_info "unicode.mapping absent, SecUnicodeMapFile desactive (coherent)"
+        fi
+    else
+        check_pass "unicode.mapping present"
+    fi
+else
+    check_info "OWASP CRS non installe"
 fi
 
 echo ""

@@ -70,7 +70,10 @@ log_info "tc nettoye."
 # --- sysctl ---
 log_info "Suppression sysctl FluxGate..."
 rm -f /etc/sysctl.d/99-fluxgate-hardening.conf
-sysctl --system 2>/dev/null | tail -3
+# Fichiers poses par le deploiement v2.0 pour conntrack
+rm -f /etc/modules-load.d/fluxgate-conntrack.conf
+rm -f /etc/modprobe.d/fluxgate-conntrack.conf
+sysctl --system >/dev/null 2>&1 || true
 log_info "Sysctl retire (reboot recommande pour valeurs par defaut)."
 
 # --- NGINX ---
@@ -90,6 +93,7 @@ a2disconf fluxgate-security 2>/dev/null || true
 log_info "Suppression jails fail2ban FluxGate..."
 rm -f /etc/fail2ban/jail.d/fluxgate-*.conf
 rm -f /etc/fail2ban/filter.d/nginx-4xx.conf /etc/fail2ban/filter.d/apache-4xx.conf
+rm -f /etc/fail2ban/action.d/fluxgate-nft.conf
 systemctl restart fail2ban 2>/dev/null || true
 
 # --- systemd ---
@@ -97,7 +101,21 @@ log_info "Suppression overrides systemd FluxGate..."
 rm -rf /etc/systemd/system/fluxgate-*.service 2>/dev/null
 rm -rf /etc/systemd/system/fluxgate-*.socket 2>/dev/null
 rm -rf /etc/systemd/system/fluxgate-web.service.d 2>/dev/null
+
+# Le drop-in v2.0 est pose dans <SVC_NAME>.service.d/ : sans ce nettoyage,
+# les limites CPU/RAM survivraient au rollback sans que rien ne l'indique.
+SVC_NAME="${SVC_NAME:-nginx}"
+if [[ -f "/etc/systemd/system/${SVC_NAME}.service.d/fluxgate-resource-limits.conf" ]]; then
+    log_info "Retrait des limites de ressources sur ${SVC_NAME}.service..."
+    rm -f "/etc/systemd/system/${SVC_NAME}.service.d/fluxgate-resource-limits.conf"
+    # Ne supprimer le repertoire que s'il est vide : d'autres drop-ins,
+    # etrangers a FluxGate, peuvent y cohabiter.
+    rmdir "/etc/systemd/system/${SVC_NAME}.service.d" 2>/dev/null || true
+fi
 systemctl daemon-reload
+if systemctl is-active "$SVC_NAME" &>/dev/null; then
+    log_warn "Redemarrer ${SVC_NAME} pour liberer les limites : systemctl restart ${SVC_NAME}"
+fi
 
 echo ""
 log_info "Rollback termine."

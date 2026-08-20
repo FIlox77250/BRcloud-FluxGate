@@ -33,7 +33,8 @@ log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee
 backup_file() {
     local file="$1"
     if [[ -f "$file" ]]; then
-        local backup="${file}.bak-$(date +%s)"
+        local backup
+        backup="${file}.bak-$(date +%s)"
         cp "$file" "$backup"
         log_info "Sauvegarde de securite creee : $backup"
     fi
@@ -52,10 +53,60 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
+mkdir -p /var/log/fluxgate "$INSTALL_DIR"
+
+# --- Validation de la configuration avant de toucher au systeme ---
+# check-config.sh refuse les placeholders, les ports incoherents et les
+# valeurs hors bornes : mieux vaut echouer ici qu'a mi-parcours.
+if [[ -x "${SCRIPT_DIR}/check-config.sh" ]] || [[ -f "${SCRIPT_DIR}/check-config.sh" ]]; then
+    if ! bash "${SCRIPT_DIR}/check-config.sh" "$CONFIG_FILE"; then
+        log_error "Configuration invalide. Deploiement annule."
+        exit 1
+    fi
+else
+    log_warn "check-config.sh introuvable : validation de config.env ignoree."
+fi
+
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-mkdir -p /var/log/fluxgate "$INSTALL_DIR"
+# --- Valeurs par defaut pour les options ajoutees en v2.0 ---
+# Permet de reutiliser un config.env issu d'une version anterieure sans le
+# reecrire entierement : les nouvelles cles prennent une valeur sure.
+ADMIN_NETS="${ADMIN_NETS:-{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/24 \}}"
+ADMIN_NETS6="${ADMIN_NETS6:-{ fc00::/7, fe80::/10 \}}"
+NFT_SYN_RATE="${NFT_SYN_RATE:-100}"
+NFT_SYN_BURST="${NFT_SYN_BURST:-150}"
+NFT_HTTP_SYN_RATE="${NFT_HTTP_SYN_RATE:-50}"
+NFT_HTTP_SYN_BURST="${NFT_HTTP_SYN_BURST:-100}"
+SYNPROXY_ENABLED="${SYNPROXY_ENABLED:-false}"
+SYNPROXY_MSS="${SYNPROXY_MSS:-1460}"
+SYNPROXY_WSCALE="${SYNPROXY_WSCALE:-7}"
+CONNTRACK_MAX="${CONNTRACK_MAX:-262144}"
+CONNTRACK_BUCKETS="${CONNTRACK_BUCKETS:-65536}"
+SOMAXCONN="${SOMAXCONN:-4096}"
+TCP_MAX_SYN_BACKLOG="${TCP_MAX_SYN_BACKLOG:-8192}"
+TCP_CONGESTION_CONTROL="${TCP_CONGESTION_CONTROL:-bbr}"
+DEFAULT_QDISC="${DEFAULT_QDISC:-fq}"
+F2B_HTTP_MAXRETRY="${F2B_HTTP_MAXRETRY:-100}"
+F2B_HTTP_FINDTIME="${F2B_HTTP_FINDTIME:-60}"
+F2B_HTTP_BANTIME="${F2B_HTTP_BANTIME:-600}"
+F2B_USE_FLUXGATE_SETS="${F2B_USE_FLUXGATE_SETS:-true}"
+SVC_NAME="${SVC_NAME:-nginx}"
+SVC_CPU_QUOTA="${SVC_CPU_QUOTA:-80%}"
+SVC_MEMORY_MAX="${SVC_MEMORY_MAX:-2G}"
+SVC_MEMORY_HIGH="${SVC_MEMORY_HIGH:-1800M}"
+SVC_LIMIT_NOFILE="${SVC_LIMIT_NOFILE:-65536}"
+SVC_MAX_CONN_PER_SOURCE="${SVC_MAX_CONN_PER_SOURCE:-50}"
+SVC_BACKLOG="${SVC_BACKLOG:-4096}"
+SVC_LISTEN_PORT="${SVC_LISTEN_PORT:-8080}"
+APACHE_HEADER_TIMEOUT_MIN="${APACHE_HEADER_TIMEOUT_MIN:-10}"
+APACHE_HEADER_TIMEOUT_MAX="${APACHE_HEADER_TIMEOUT_MAX:-40}"
+APACHE_HEADER_MIN_RATE="${APACHE_HEADER_MIN_RATE:-500}"
+APACHE_BODY_TIMEOUT_MIN="${APACHE_BODY_TIMEOUT_MIN:-10}"
+APACHE_BODY_TIMEOUT_MAX="${APACHE_BODY_TIMEOUT_MAX:-60}"
+APACHE_BODY_MIN_RATE="${APACHE_BODY_MIN_RATE:-500}"
+APACHE_MAX_REQUEST_WORKERS="${APACHE_MAX_REQUEST_WORKERS:-256}"
 
 # --- Detection des outils de design (Graceful Degradation) ---
 HAS_FIGLET=false && command -v figlet &>/dev/null && HAS_FIGLET=true
@@ -63,6 +114,17 @@ HAS_GUM=false && command -v gum &>/dev/null && HAS_GUM=true
 
 # Import de la barre de progression native
 source "${SCRIPT_DIR}/progress_bar.sh" 2>/dev/null || true
+
+# Import de l'installation verifiee du CRS (sha256 + signature GPG)
+# shellcheck source=lib/crs.sh
+source "${SCRIPT_DIR}/lib/crs.sh" 2>/dev/null || log_warn "lib/crs.sh introuvable : installation CRS indisponible."
+
+# Import du rendu de nftables.conf a partir de config.env
+# shellcheck source=lib/nft-template.sh
+if ! source "${SCRIPT_DIR}/lib/nft-template.sh" 2>/dev/null; then
+    log_error "lib/nft-template.sh introuvable : impossible d'appliquer config.env au pare-feu."
+    exit 1
+fi
 
 print_banner() {
     local title="$1"
@@ -109,10 +171,66 @@ chmod +x "$INSTALL_DIR"/xdp/*.sh "$INSTALL_DIR"/tc/*.sh "$INSTALL_DIR"/nftables/
 # =============================================================================
 show_progress 2 8 "Optimisation noyau (sysctl)..."
 log_info "=== Etape 2/8 : Kernel tuning (sysctl) ==="
-backup_file /etc/sysctl.d/99-fluxgate-hardening.conf
-cp "$INSTALL_DIR/sysctl/99-fluxgate-hardening.conf" /etc/sysctl.d/
-sysctl --system 2>&1 | tail -5 | tee -a "$LOG_FILE"
-log_info "Sysctl applique."
+
+# Les cles net.netfilter.* n'existent pas tant que nf_conntrack n'est pas
+# charge : sans ce modprobe, sysctl --system sort en erreur et, sous
+# 'set -o pipefail', interrompt tout le deploiement a l'etape 2/8.
+if ! lsmod 2>/dev/null | grep -q '^nf_conntrack'; then
+    log_info "Chargement du module nf_conntrack..."
+    modprobe nf_conntrack 2>/dev/null || log_warn "Impossible de charger nf_conntrack (conteneur / noyau sans module ?)."
+fi
+# Persister le chargement au reboot
+if [[ -d /etc/modules-load.d ]]; then
+    echo "nf_conntrack" > /etc/modules-load.d/fluxgate-conntrack.conf
+fi
+
+SYSCTL_CONF="/etc/sysctl.d/99-fluxgate-hardening.conf"
+backup_file "$SYSCTL_CONF"
+cp "$INSTALL_DIR/sysctl/99-fluxgate-hardening.conf" "$SYSCTL_CONF"
+
+# Appliquer les valeurs de config.env (match par cle, jamais par valeur)
+sed -i "s|^net.netfilter.nf_conntrack_max = .*|net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}|" "$SYSCTL_CONF"
+sed -i "s|^net.core.somaxconn = .*|net.core.somaxconn = ${SOMAXCONN}|" "$SYSCTL_CONF"
+sed -i "s|^net.ipv4.tcp_max_syn_backlog = .*|net.ipv4.tcp_max_syn_backlog = ${TCP_MAX_SYN_BACKLOG}|" "$SYSCTL_CONF"
+sed -i "s|^net.core.default_qdisc = .*|net.core.default_qdisc = ${DEFAULT_QDISC}|" "$SYSCTL_CONF"
+sed -i "s|^net.ipv4.tcp_congestion_control = .*|net.ipv4.tcp_congestion_control = ${TCP_CONGESTION_CONTROL}|" "$SYSCTL_CONF"
+
+# nf_conntrack_buckets n'est pas reglable via sysctl.d de maniere fiable :
+# il s'ecrit dans /sys au runtime et se fixe en parametre de module au boot.
+if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+    echo "$CONNTRACK_BUCKETS" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null \
+        && log_info "conntrack hashsize = $CONNTRACK_BUCKETS" \
+        || log_warn "Impossible d'ecrire conntrack hashsize."
+fi
+if [[ -d /etc/modprobe.d ]]; then
+    echo "options nf_conntrack hashsize=${CONNTRACK_BUCKETS}" > /etc/modprobe.d/fluxgate-conntrack.conf
+fi
+
+# BBR necessite le module tcp_bbr : le charger avant d'appliquer le sysctl,
+# sinon la valeur est refusee silencieusement et on reste en cubic.
+if [[ "$TCP_CONGESTION_CONTROL" == "bbr" ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! grep -q "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        log_warn "bbr indisponible sur ce noyau : bascule sur cubic."
+        sed -i "s|^net.ipv4.tcp_congestion_control = .*|net.ipv4.tcp_congestion_control = cubic|" "$SYSCTL_CONF"
+    fi
+fi
+
+# Ne pas laisser une cle inconnue tuer le deploiement : on journalise et on
+# verifie le resultat reel juste apres.
+if sysctl --system >>"$LOG_FILE" 2>&1; then
+    log_info "Sysctl applique."
+else
+    log_warn "sysctl --system a signale des erreurs (cles non supportees par ce noyau)."
+    log_warn "Detail dans $LOG_FILE. Verification des valeurs critiques :"
+fi
+
+for key in net.ipv4.tcp_syncookies net.core.somaxconn net.ipv4.tcp_max_syn_backlog; do
+    val=$(sysctl -n "$key" 2>/dev/null || echo "N/A")
+    log_info "  $key = $val"
+done
+CC_ACTIVE=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+log_info "  net.ipv4.tcp_congestion_control = $CC_ACTIVE"
 
 # =============================================================================
 # 3. nftables
@@ -125,10 +243,23 @@ if command -v nft &>/dev/null; then
     backup_file "$NFTCONF"
     cp "$INSTALL_DIR/nftables/nftables.conf" "$NFTCONF"
 
-    # Remplacer les valeurs de ports (match par nom de variable, pas par valeur)
-    sed -i "s/^define SSH_PORT   = .*/define SSH_PORT   = ${SSH_PORT}/" "$NFTCONF"
-    sed -i "s/^define HTTP_PORT  = .*/define HTTP_PORT  = ${HTTP_PORT}/" "$NFTCONF"
-    sed -i "s/^define HTTPS_PORT = .*/define HTTPS_PORT = ${HTTPS_PORT}/" "$NFTCONF"
+    # --- SYNPROXY : confirmation explicite avant activation ---
+    # La valeur de config.env ne suffit pas : une erreur de parametrage rend
+    # le service web injoignable, on redemande donc de vive voix.
+    if [[ "$SYNPROXY_ENABLED" == "true" ]]; then
+        log_warn "SYNPROXY demande : delegation du handshake TCP au noyau."
+        log_warn "Mal configure, SYNPROXY rend le service web injoignable."
+        if [[ "$HAS_GUM" == "true" ]]; then
+            gum confirm "Activer SYNPROXY sur les ports ${HTTP_PORT}/${HTTPS_PORT} ?" --default=false \
+                || SYNPROXY_ENABLED=false
+        else
+            read -rp "Activer SYNPROXY sur les ports ${HTTP_PORT}/${HTTPS_PORT} ? (y/N) " synproxy_confirm
+            [[ "$synproxy_confirm" =~ ^[yY]$ ]] || SYNPROXY_ENABLED=false
+        fi
+        [[ "$SYNPROXY_ENABLED" == "true" ]] \
+            && log_info "SYNPROXY sera active (mss=${SYNPROXY_MSS} wscale=${SYNPROXY_WSCALE})." \
+            || log_info "SYNPROXY laisse desactive."
+    fi
 
     # --- Securite anti-lockout SSH interactive ---
     echo ""
@@ -156,8 +287,8 @@ if command -v nft &>/dev/null; then
 
     if [[ "$SSH_MODE" == "open" ]]; then
         log_info "Option choisie : SSH ouvert a tous avec protections. Desactivation de la restriction ADMIN_NETS."
-        # Commenter la ligne restrictive ADMIN_NETS dans nftables.conf
-        sed -i 's/^[[:space:]]*tcp dport \$SSH_PORT ip saddr \$ADMIN_NETS/# tcp dport \$SSH_PORT ip saddr \$ADMIN_NETS/' "$NFTCONF"
+        # Le commentaire des deux lignes admin (IPv4 + IPv6) est applique par
+        # render_nftables_conf via SSH_MODE, plus bas.
     else
         log_info "Option choisie : Acces SSH strict (restreint a ADMIN_NETS)."
         # --- Securite anti-lockout SSH ---
@@ -179,9 +310,23 @@ if command -v nft &>/dev/null; then
         
         if [[ -n "$SSH_IP" ]]; then
             log_info "IP de l'administrateur a verifier : $SSH_IP"
-            # Extraire le contenu de ADMIN_NETS
-            NETS_CONTENT=$(grep -E '^[[:space:]]*define ADMIN_NETS[[:space:]]*=' "$NFTCONF" | grep -oP '\{\K[^\}]+' | sed 's/,/ /g' || echo "")
-            
+
+            # Determiner la famille : le set et le prefixe different en IPv6.
+            if [[ "$SSH_IP" == *:* ]]; then
+                ADMIN_DEFINE="ADMIN_NETS6"
+                ADMIN_PREFIX="128"
+                CURRENT_NETS="$ADMIN_NETS6"
+                log_info "Session detectee en IPv6 : whitelist ciblee sur ADMIN_NETS6."
+            else
+                ADMIN_DEFINE="ADMIN_NETS"
+                ADMIN_PREFIX="32"
+                CURRENT_NETS="$ADMIN_NETS"
+            fi
+
+            # On raisonne sur la variable de config, pas sur le fichier : le
+            # fichier n'est rendu qu'une fois, apres toutes les decisions.
+            NETS_CONTENT=$(echo "$CURRENT_NETS" | tr -d '{}' | tr ',' ' ')
+
             IS_WHITELISTED=false
             if [[ -n "$NETS_CONTENT" ]]; then
                 if command -v python3 &>/dev/null; then
@@ -190,8 +335,12 @@ if command -v nft &>/dev/null; then
                         IS_WHITELISTED=true
                     fi
                 else
+                    # Repli sans python3 : comparaison exacte uniquement.
+                    # Volontairement conservateur, une correspondance approximative
+                    # ferait croire a tort que l'IP est protegee.
+                    log_warn "python3 absent : verification d'appartenance reseau limitee a l'egalite stricte."
                     for net in $NETS_CONTENT; do
-                        if [[ "$SSH_IP" == "${net%/32}" ]] || [[ "$SSH_IP" == ${net%.*}* ]]; then
+                        if [[ "$SSH_IP" == "${net%/*}" ]]; then
                             IS_WHITELISTED=true
                             break
                         fi
@@ -200,37 +349,68 @@ if command -v nft &>/dev/null; then
             fi
 
             if [[ "$IS_WHITELISTED" == "false" ]]; then
-                log_warn "Votre IP ($SSH_IP) n'est pas whitelistee dans ADMIN_NETS."
+                log_warn "Votre IP ($SSH_IP) n'est pas whitelistee dans ${ADMIN_DEFINE}."
+                ADD_IP=false
                 if [[ "$HAS_GUM" == "true" ]]; then
-                    gum confirm "Voulez-vous ajouter dynamiquement votre IP ($SSH_IP/32) a la whitelist ?" --default=true && {
-                        sed -i "s/define ADMIN_NETS[[:space:]]*=[[:space:]]*{[[:space:]]*/define ADMIN_NETS = { ${SSH_IP}\/32, /" "$NFTCONF"
-                        log_info "IP $SSH_IP/32 ajoutee dynamiquement a ADMIN_NETS dans $NFTCONF."
-                    } || log_warn "IP non ajoutee."
+                    gum confirm "Ajouter votre IP (${SSH_IP}/${ADMIN_PREFIX}) a ${ADMIN_DEFINE} ?" --default=true && ADD_IP=true
                 else
-                    read -rp "Voulez-vous ajouter dynamiquement votre IP ($SSH_IP/32) a la whitelist ? (Y/n) " add_ip
-                    if [[ "${add_ip:-y}" =~ ^[yY]$ ]]; then
-                        sed -i "s/define ADMIN_NETS[[:space:]]*=[[:space:]]*{[[:space:]]*/define ADMIN_NETS = { ${SSH_IP}\/32, /" "$NFTCONF"
-                        log_info "IP $SSH_IP/32 ajoutee dynamiquement a ADMIN_NETS dans $NFTCONF."
+                    read -rp "Ajouter votre IP (${SSH_IP}/${ADMIN_PREFIX}) a ${ADMIN_DEFINE} ? (Y/n) " add_ip
+                    [[ "${add_ip:-y}" =~ ^[yY]$ ]] && ADD_IP=true
+                fi
+
+                if [[ "$ADD_IP" == "true" ]]; then
+                    # Ajout en tete du set, dans la variable : le rendu du
+                    # fichier a lieu ensuite et prendra la valeur a jour.
+                    NEW_NETS="{ ${SSH_IP}/${ADMIN_PREFIX}, ${CURRENT_NETS#\{ }"
+                    if [[ "$ADMIN_DEFINE" == "ADMIN_NETS6" ]]; then
+                        ADMIN_NETS6="$NEW_NETS"
                     else
-                        log_warn "Continuer sans whitelister votre IP active peut couper votre connexion SSH."
-                        read -rp "Etes-vous sur de vouloir continuer le deploiement ? (y/N) " force_continue
-                        [[ "$force_continue" =~ ^[yY]$ ]] || { log_info "Deploiement annule."; exit 0; }
+                        ADMIN_NETS="$NEW_NETS"
                     fi
+                    log_info "IP ${SSH_IP}/${ADMIN_PREFIX} ajoutee a ${ADMIN_DEFINE}."
+                else
+                    log_warn "Continuer sans whitelister votre IP active peut couper votre connexion SSH."
+                    read -rp "Etes-vous sur de vouloir continuer le deploiement ? (y/N) " force_continue
+                    [[ "$force_continue" =~ ^[yY]$ ]] || { log_info "Deploiement annule."; exit 0; }
                 fi
             else
-                log_info "Votre IP active ($SSH_IP) est deja whitelistee dans ADMIN_NETS."
+                log_info "Votre IP active ($SSH_IP) est deja whitelistee dans ${ADMIN_DEFINE}."
             fi
         fi
     fi
 
-    # Backup des regles actuelles avant application
-    nft list ruleset > /etc/nftables.conf.bak 2>/dev/null || true
-    log_info "Backup nftables sauvegarde dans /etc/nftables.conf.bak"
+    # --- Rendu de la configuration ---
+    # Toutes les decisions (ports, reseaux admin, seuils, mode SSH, SYNPROXY)
+    # sont prises : on applique config.env au fichier en une seule passe.
+    # render_nftables_conf echoue si une ancre a disparu du modele, ce qui
+    # evite de deployer silencieusement les valeurs par defaut.
+    export SSH_MODE ADMIN_NETS ADMIN_NETS6 SYNPROXY_ENABLED
+    if ! render_nftables_conf "$NFTCONF"; then
+        log_error "Application de config.env dans $NFTCONF impossible."
+        log_error "Le modele nftables.conf a probablement ete modifie sans mettre a jour lib/nft-template.sh."
+        exit 1
+    fi
+    log_info "Configuration appliquee : SSH=${SSH_PORT} (${SSH_MODE}), ${NFT_SYN_RATE}/s par IP, ${NFT_HTTP_SYN_RATE}/s global HTTP(S)."
+
+    # Backup des regles actuelles avant application.
+    # 'nft list ruleset' produit un dump SANS 'flush ruleset' en tete : le
+    # rejouer tel quel empile les regles sur celles deja en place au lieu de
+    # restaurer l'etat d'origine. On prefixe donc le flush nous-memes, sinon
+    # le filet anti-lockout ne rend pas la main comme prevu.
+    NFT_BACKUP="/etc/nftables.conf.bak"
+    {
+        echo "#!/usr/sbin/nft -f"
+        echo "# Backup FluxGate du $(date '+%Y-%m-%d %H:%M:%S') - restaurable tel quel"
+        echo "flush ruleset"
+        nft list ruleset 2>/dev/null || true
+    } > "$NFT_BACKUP"
+    chmod 600 "$NFT_BACKUP"
+    log_info "Backup nftables sauvegarde dans $NFT_BACKUP (avec flush prealable)."
 
     # Programmer un rollback automatique dans 5 minutes (filet anti-lockout SSH)
     ROLLBACK_JOB=""
     if command -v at &>/dev/null; then
-        ROLLBACK_JOB=$(echo "nft -f /etc/nftables.conf.bak 2>/dev/null || nft flush ruleset" | at now + 5 minutes 2>&1 | grep -oP 'job \K[0-9]+') || true
+        ROLLBACK_JOB=$(echo "nft -f ${NFT_BACKUP} 2>/dev/null || nft flush ruleset" | at now + 5 minutes 2>&1 | grep -oP 'job \K[0-9]+') || true
         if [[ -n "$ROLLBACK_JOB" ]]; then
             log_warn "Rollback automatique programme dans 5 minutes (job $ROLLBACK_JOB)."
             log_warn "Si tout va bien, il sera annule automatiquement."
@@ -239,13 +419,19 @@ if command -v nft &>/dev/null; then
         log_warn "'at' non disponible. Pas de rollback automatique programme."
     fi
 
-    # Tester la syntaxe de nftables avant d'appliquer
+    # Tester la syntaxe de nftables avant d'appliquer.
+    # Une syntaxe invalide est bloquante : appliquer quand meme laisserait le
+    # serveur soit sans pare-feu, soit avec un ruleset partiel.
     log_info "Verification de la syntaxe nftables..."
-    if nft -c -f "$NFTCONF" 2>/dev/null; then
+    if nft -c -f "$NFTCONF" 2>>"$LOG_FILE"; then
         log_info "Syntaxe nftables valide."
     else
-        log_warn "Erreur de syntaxe detectee dans nftables.conf !"
-        nft -c -f "$NFTCONF" || true
+        log_error "Erreur de syntaxe dans $NFTCONF :"
+        nft -c -f "$NFTCONF" 2>&1 | tee -a "$LOG_FILE" || true
+        log_error "Deploiement nftables interrompu, aucune regle appliquee."
+        log_info "Les regles actuelles sont intactes. Backup : $NFT_BACKUP"
+        [[ -n "${ROLLBACK_JOB:-}" ]] && atrm "$ROLLBACK_JOB" 2>/dev/null || true
+        exit 1
     fi
 
     # Appliquer les nouvelles regles et charger le service
@@ -331,8 +517,23 @@ if command -v nginx &>/dev/null; then
                 systemctl reload nginx
                 log_info "HTTPS active avec Let's Encrypt ($CERT_DOMAIN)."
             else
-                log_warn "Erreur config HTTPS. Bloc HTTPS desactive."
-                sed -i '/^--- HTTPS BEGIN ---$/,/^--- HTTPS END ---$/{s/# //; s/^/# /}' /etc/nginx/conf.d/fluxgate.conf
+                log_warn "Erreur config HTTPS. Restauration de la conf precedente."
+                # Le repli d'origine cherchait '^--- HTTPS BEGIN ---' alors que
+                # le marqueur reel est '# --- HTTPS BEGIN ---' : il ne matchait
+                # jamais et laissait nginx avec une conf cassee. On restaure
+                # directement la copie de reference plutot que de re-commenter
+                # a la main un bloc deja modifie par deux sed successifs.
+                cp "$INSTALL_DIR/nginx/nginx-fluxgate.conf" /etc/nginx/conf.d/fluxgate.conf
+                sed -i "s/rate=[0-9]\+r\/s/rate=${NGINX_REQ_PER_SEC}r\/s/g" /etc/nginx/conf.d/fluxgate.conf
+                sed -i "s/burst=[0-9]\+/burst=${NGINX_BURST}/g" /etc/nginx/conf.d/fluxgate.conf
+                sed -i "s/limit_conn conn_per_ip [0-9]\+/limit_conn conn_per_ip ${NGINX_MAX_CONN_PER_IP}/g" /etc/nginx/conf.d/fluxgate.conf
+                sed -i "s/127\.0\.0\.1:[0-9]\+/127.0.0.1:${NGINX_UPSTREAM_PORT}/g" /etc/nginx/conf.d/fluxgate.conf
+                if nginx -t 2>&1; then
+                    systemctl reload nginx
+                    log_info "Conf NGINX sans HTTPS restauree et rechargee."
+                else
+                    log_error "NGINX reste en erreur apres restauration : verifier manuellement."
+                fi
             fi
         else
             log_info "Pas de certificat Let's Encrypt detecte."
@@ -347,23 +548,11 @@ if command -v nginx &>/dev/null; then
         
         # --- Assurer la presence des regles OWASP CRS ---
         if [[ ! -d /etc/modsecurity/crs/rules ]] || [[ -z "$(ls -A /etc/modsecurity/crs/rules 2>/dev/null)" ]]; then
-            log_warn "Regles OWASP CRS manquantes dans /etc/modsecurity/crs/rules. Telechargement..."
-            mkdir -p /etc/modsecurity/crs
-            temp_tar="/tmp/crs.tar.gz"
-            if command -v curl &>/dev/null; then
-                curl -sL -o "$temp_tar" "https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.0.0.tar.gz" || true
-            elif command -v wget &>/dev/null; then
-                wget -q -O "$temp_tar" "https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.0.0.tar.gz" || true
-            fi
-            if [[ -f "$temp_tar" ]]; then
-                tar xz --strip-components=1 -C /etc/modsecurity/crs -f "$temp_tar" 2>/dev/null || true
-                rm -f "$temp_tar"
-                if [[ -f /etc/modsecurity/crs/crs-setup.conf.example ]] && [[ ! -f /etc/modsecurity/crs/crs-setup.conf ]]; then
-                    cp /etc/modsecurity/crs/crs-setup.conf.example /etc/modsecurity/crs/crs-setup.conf
-                fi
-                log_info "OWASP CRS telecharge et installe avec succes."
+            log_warn "Regles OWASP CRS manquantes dans /etc/modsecurity/crs/rules."
+            if install_owasp_crs /etc/modsecurity/crs; then
+                log_info "OWASP CRS installe et verifie."
             else
-                log_error "Echec du telechargement de OWASP CRS."
+                log_error "Installation du CRS echouee : le WAF restera sans regles."
             fi
         fi
 
@@ -434,8 +623,21 @@ log_info "=== Etape 5/8 : Apache (alternatif) ==="
 if command -v apachectl &>/dev/null && ! command -v nginx &>/dev/null; then
     backup_file /etc/apache2/conf-available/fluxgate-security.conf
     backup_file /etc/httpd/conf.d/fluxgate-security.conf
-    cp "$INSTALL_DIR/apache/security-hardening.conf" /etc/apache2/conf-available/fluxgate-security.conf 2>/dev/null || \
-    cp "$INSTALL_DIR/apache/security-hardening.conf" /etc/httpd/conf.d/fluxgate-security.conf 2>/dev/null || true
+    APACHE_CONF=""
+    if [[ -d /etc/apache2/conf-available ]]; then
+        cp "$INSTALL_DIR/apache/security-hardening.conf" /etc/apache2/conf-available/fluxgate-security.conf
+        APACHE_CONF="/etc/apache2/conf-available/fluxgate-security.conf"
+    elif [[ -d /etc/httpd/conf.d ]]; then
+        cp "$INSTALL_DIR/apache/security-hardening.conf" /etc/httpd/conf.d/fluxgate-security.conf
+        APACHE_CONF="/etc/httpd/conf.d/fluxgate-security.conf"
+    fi
+
+    # Appliquer les valeurs de config.env (jamais cablees auparavant)
+    if [[ -n "$APACHE_CONF" ]]; then
+        sed -i "s|^\([[:space:]]*\)RequestReadTimeout .*|\1RequestReadTimeout header=${APACHE_HEADER_TIMEOUT_MIN}-${APACHE_HEADER_TIMEOUT_MAX},MinRate=${APACHE_HEADER_MIN_RATE} body=${APACHE_BODY_TIMEOUT_MIN}-${APACHE_BODY_TIMEOUT_MAX},MinRate=${APACHE_BODY_MIN_RATE}|" "$APACHE_CONF"
+        sed -i "s|^\([[:space:]]*\)MaxRequestWorkers .*|\1MaxRequestWorkers ${APACHE_MAX_REQUEST_WORKERS}|" "$APACHE_CONF"
+        log_info "Timeouts Apache appliques (header ${APACHE_HEADER_TIMEOUT_MIN}-${APACHE_HEADER_TIMEOUT_MAX}, body ${APACHE_BODY_TIMEOUT_MIN}-${APACHE_BODY_TIMEOUT_MAX})."
+    fi
 
     a2enmod reqtimeout headers rewrite 2>/dev/null || true
     a2enconf fluxgate-security 2>/dev/null || true
@@ -494,6 +696,34 @@ if command -v fail2ban-client &>/dev/null; then
     sed -i "s/^findtime = .*/findtime = ${F2B_SSH_FINDTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
     sed -i "s/^bantime  = .*/bantime  = ${F2B_SSH_BANTIME}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
 
+    # Le port SSH declare doit figurer dans la jail, sinon les actions qui
+    # raisonnent par port (autres que allports) visent le mauvais service.
+    sed -i "s/^port     = ssh$/port     = ${SSH_PORT}/" /etc/fail2ban/jail.d/fluxgate-sshd.conf
+
+    # --- Seuils HTTP (jail principale nginx-4xx / apache-4xx) ---
+    # Ces valeurs n'etaient jusqu'ici jamais appliquees depuis config.env.
+    # On ne touche que la premiere jail de chaque fichier : les jails
+    # limit-req et botsearch gardent leurs seuils propres, plus agressifs.
+    for jail_file in /etc/fail2ban/jail.d/fluxgate-nginx.conf /etc/fail2ban/jail.d/fluxgate-apache.conf; do
+        [[ -f "$jail_file" ]] || continue
+        sed -i "0,/^maxretry = .*/s//maxretry = ${F2B_HTTP_MAXRETRY}/" "$jail_file"
+        sed -i "0,/^findtime = .*/s//findtime = ${F2B_HTTP_FINDTIME}/" "$jail_file"
+        sed -i "0,/^bantime  = .*/s//bantime  = ${F2B_HTTP_BANTIME}/" "$jail_file"
+        log_info "Seuils HTTP appliques a $(basename "$jail_file")."
+    done
+
+    # --- Action de ban : sets FluxGate plutot que table f2b separee ---
+    if [[ "$F2B_USE_FLUXGATE_SETS" == "true" ]] && [[ -f "$INSTALL_DIR/fail2ban/action.d/fluxgate-nft.conf" ]]; then
+        mkdir -p /etc/fail2ban/action.d
+        cp "$INSTALL_DIR/fail2ban/action.d/fluxgate-nft.conf" /etc/fail2ban/action.d/
+        # Rediriger toutes les jails FluxGate vers cette action
+        sed -i "s/^banaction = nftables\[type=allports\]$/banaction = fluxgate-nft/" /etc/fail2ban/jail.d/fluxgate-*.conf
+        log_info "fail2ban bannira dans les sets FluxGate (blocklist4/blocklist6)."
+        log_info "  Consultation : bash $INSTALL_DIR/nftables/nft-manage.sh list-blocked"
+    else
+        log_info "fail2ban conserve l'action nftables standard (table f2b dediee)."
+    fi
+
     log_info "Redemarrage du service fail2ban..."
     systemctl enable fail2ban 2>/dev/null || true
     if systemctl restart fail2ban 2>/dev/null; then
@@ -530,10 +760,60 @@ fi
 # =============================================================================
 show_progress 8 8 "systemd resource control (Fini !)"
 log_info "=== Etape 8/8 : systemd resource control ==="
-# Copier les templates (l'utilisateur doit adapter le nom du service)
-cp -r "$INSTALL_DIR/systemd/"* /etc/systemd/system/ 2>/dev/null || true
+
+# L'ancienne version copiait le dossier 'fluxgate-web.service.d' tel quel dans
+# /etc/systemd/system/ : systemd n'applique un drop-in que s'il est place dans
+# <nom-du-service>.service.d/, donc les limites n'etaient appliquees a rien.
+# On cible desormais le service reel indique par SVC_NAME.
+if systemctl list-unit-files "${SVC_NAME}.service" &>/dev/null && \
+   systemctl cat "${SVC_NAME}.service" &>/dev/null; then
+
+    DROPIN_DIR="/etc/systemd/system/${SVC_NAME}.service.d"
+    mkdir -p "$DROPIN_DIR"
+    backup_file "${DROPIN_DIR}/fluxgate-resource-limits.conf"
+    cp "$INSTALL_DIR/systemd/fluxgate-web.service.d/resource-limits.conf" \
+       "${DROPIN_DIR}/fluxgate-resource-limits.conf"
+
+    DROPIN="${DROPIN_DIR}/fluxgate-resource-limits.conf"
+    sed -i "s/^CPUQuota=.*/CPUQuota=${SVC_CPU_QUOTA}/"        "$DROPIN"
+    sed -i "s/^MemoryMax=.*/MemoryMax=${SVC_MEMORY_MAX}/"     "$DROPIN"
+    sed -i "s/^MemoryHigh=.*/MemoryHigh=${SVC_MEMORY_HIGH}/"  "$DROPIN"
+    sed -i "s/^LimitNOFILE=.*/LimitNOFILE=${SVC_LIMIT_NOFILE}/" "$DROPIN"
+
+    # ProtectSystem=strict casse les serveurs web qui ecrivent leurs logs et
+    # leur cache hors /var/log : on ne l'impose pas a un service existant
+    # dont on ne connait pas les chemins.
+    sed -i "s/^ProtectSystem=strict/ProtectSystem=full/" "$DROPIN"
+
+    systemctl daemon-reload
+    log_info "Limites appliquees a ${SVC_NAME}.service : CPU=${SVC_CPU_QUOTA}, RAM=${SVC_MEMORY_MAX}, NOFILE=${SVC_LIMIT_NOFILE}"
+    log_info "Actives au prochain redemarrage : systemctl restart ${SVC_NAME}"
+
+    if systemctl show "${SVC_NAME}.service" -p CPUQuotaPerSecUSec --value 2>/dev/null | grep -qv "infinity"; then
+        log_info "Drop-in pris en compte par systemd."
+    fi
+else
+    log_warn "Service '${SVC_NAME}' introuvable : limites de ressources non appliquees."
+    log_warn "Renseigner SVC_NAME dans config.env avec un service existant (ex: nginx, apache2)."
+    # Le template reste disponible pour une application manuelle
+    mkdir -p /etc/systemd/system/fluxgate-web.service.d
+    cp "$INSTALL_DIR/systemd/fluxgate-web.service.d/resource-limits.conf" \
+       /etc/systemd/system/fluxgate-web.service.d/ 2>/dev/null || true
+    log_info "Template laisse dans /etc/systemd/system/fluxgate-web.service.d/"
+fi
+
+# Socket d'activation : template, adapte mais volontairement pas active.
+# L'activer d'office detournerait le port d'un service applicatif existant.
+if [[ -f "$INSTALL_DIR/systemd/fluxgate-app.socket" ]]; then
+    cp "$INSTALL_DIR/systemd/fluxgate-app.socket" /etc/systemd/system/
+    sed -i "s/^ListenStream=.*/ListenStream=${SVC_LISTEN_PORT}/"                     /etc/systemd/system/fluxgate-app.socket
+    sed -i "s/^MaxConnectionsPerSource=.*/MaxConnectionsPerSource=${SVC_MAX_CONN_PER_SOURCE}/" /etc/systemd/system/fluxgate-app.socket
+    sed -i "s/^Backlog=.*/Backlog=${SVC_BACKLOG}/"                                   /etc/systemd/system/fluxgate-app.socket
+    log_info "Socket template configure (port ${SVC_LISTEN_PORT}, ${SVC_MAX_CONN_PER_SOURCE} conn/IP), non active."
+fi
+
+cp "$INSTALL_DIR/systemd/fluxgate-xdp-autoblock.service" /etc/systemd/system/ 2>/dev/null || true
 systemctl daemon-reload
-log_info "Templates systemd copies. Adapter selon vos services."
 
 # =============================================================================
 # XDP (optionnel)
