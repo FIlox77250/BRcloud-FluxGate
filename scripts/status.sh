@@ -139,7 +139,11 @@ if command -v fail2ban-client &>/dev/null && systemctl is-active fail2ban &>/dev
 
     # Lister les jails avec le nombre de bans
     for jail in $(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*:\s*//;s/,/ /g'); do
-        BANNED=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
+        # '|| true' obligatoire : si la sortie ne contient pas "Currently banned"
+        # (version ou locale differente de fail2ban), grep sort en 1 et, sous
+        # 'set -o pipefail', le dashboard s'interrompt au milieu du rendu.
+        BANNED=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || true)
+        BANNED="${BANNED:-?}"
         echo "  Jail $jail : $BANNED IP(s) bannies"
     done
 else

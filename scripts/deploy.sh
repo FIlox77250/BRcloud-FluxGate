@@ -126,6 +126,13 @@ if ! source "${SCRIPT_DIR}/lib/nft-template.sh" 2>/dev/null; then
     exit 1
 fi
 
+# Import de la preservation des IP bloquees entre deux deploiements
+# shellcheck source=lib/blocklist.sh
+if ! source "${SCRIPT_DIR}/lib/blocklist.sh" 2>/dev/null; then
+    log_error "lib/blocklist.sh introuvable."
+    exit 1
+fi
+
 print_banner() {
     local title="$1"
     if [[ "$HAS_FIGLET" == "true" ]]; then
@@ -396,19 +403,7 @@ if command -v nft &>/dev/null; then
     # 'flush ruleset' recree les sets vides : sur un serveur deja en service,
     # un redeploiement relacherait d'un coup tous les attaquants bannis.
     # On releve les adresses avant, on les reinjecte apres.
-    SAVED_BLOCKED4=""
-    SAVED_BLOCKED6=""
-    if nft list set inet filter blocklist4 &>/dev/null; then
-        SAVED_BLOCKED4=$(nft list set inet filter blocklist4 2>/dev/null \
-            | sed -n '/elements = {/,/}/p' \
-            | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u | tr '\n' ' ')
-    fi
-    if nft list set inet filter blocklist6 &>/dev/null; then
-        SAVED_BLOCKED6=$(nft list set inet filter blocklist6 2>/dev/null \
-            | sed -n '/elements = {/,/}/p' \
-            | grep -oE '\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b' | sort -u | tr '\n' ' ')
-    fi
-    NB_SAVED=$(echo "$SAVED_BLOCKED4 $SAVED_BLOCKED6" | wc -w)
+    NB_SAVED=$(save_blocklists)
     if [[ "$NB_SAVED" -gt 0 ]]; then
         log_info "$NB_SAVED IP actuellement bloquee(s) : elles seront reinjectees apres application."
     fi
@@ -480,13 +475,7 @@ if command -v nft &>/dev/null; then
     # Le temps d'expiration restant n'est pas conservable : les entrees
     # repartent sur le timeout par defaut du set (1h).
     if [[ -n "${SAVED_BLOCKED4// }" ]] || [[ -n "${SAVED_BLOCKED6// }" ]]; then
-        RESTORED=0
-        for ip in $SAVED_BLOCKED4; do
-            nft add element inet filter blocklist4 "{ $ip }" 2>/dev/null && RESTORED=$((RESTORED+1))
-        done
-        for ip in $SAVED_BLOCKED6; do
-            nft add element inet filter blocklist6 "{ $ip }" 2>/dev/null && RESTORED=$((RESTORED+1))
-        done
+        RESTORED=$(restore_blocklists "$SAVED_BLOCKED4" "$SAVED_BLOCKED6")
         log_info "$RESTORED IP bloquee(s) reinjectee(s) (expiration remise au defaut du set)."
     fi
 
