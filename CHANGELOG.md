@@ -49,6 +49,28 @@ tiers à jour.
   courant, et une commande `restore` permet de revenir en arrière.
 - `SC2155` corrigé dans `deploy.sh` (`local` et affectation séparés).
 
+### Mise à jour depuis la v1
+
+Deux défauts rendaient la mise à jour d'un serveur déjà déployé impossible ou
+inopérante ; ils sont corrigés :
+
+- **`check-config.sh` bloquait toute mise à jour.** Un `config.env` de la v1 ne
+  contient pas les 17 clés ajoutées depuis ; elles étaient traitées comme des
+  erreurs fatales et le déploiement s'arrêtait avant de commencer. Ces clés sont
+  désormais des avertissements, avec repli sur les valeurs par défaut et renvoi
+  vers `migrate-config.sh`.
+- **Le CRS n'était jamais mis à jour.** La condition testait l'existence du
+  répertoire de règles, pas la version : un serveur déjà déployé serait resté
+  indéfiniment en 4.0.0, alors que c'est le principal apport de cette version.
+  `crs_needs_update()` compare la version réellement installée à la cible.
+
+Ajout de `scripts/migrate-config.sh` (fusion des clés manquantes sans écraser
+les valeurs existantes, idempotent, `--dry-run` disponible) et préservation des
+IP bloquées à travers le `flush ruleset` d'un redéploiement.
+
+Procédure complète dans le README, section « Mettre à jour un serveur déjà
+déployé ».
+
 ### Ajouté
 
 - `scripts/check-config.sh` — validation de `config.env` avant tout déploiement :
