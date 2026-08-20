@@ -563,17 +563,16 @@ if [[ "$INSTALL_WAF" == "true" ]]; then
         log_error "Echec installation ModSecurity."
     fi
 
-    # Telecharger OWASP CRS (version epinglee, sha256 + signature verifies)
+    # Telecharger OWASP CRS (version epinglee, sha256 + signature verifies).
+    # crs_needs_update gere aussi le cas d'une version anterieure deja en place.
     CRS_DIR="/etc/modsecurity/crs"
-    if [[ ! -d "$CRS_DIR/rules" ]]; then
+    if crs_needs_update "$CRS_DIR"; then
         if install_owasp_crs "$CRS_DIR"; then
             INSTALLED+=("owasp-crs-v${CRS_VERSION}")
         else
             log_error "Installation OWASP CRS echouee (integrite ou telechargement)."
             FAILED+=("owasp-crs")
         fi
-    else
-        log_info "OWASP CRS deja present dans $CRS_DIR"
     fi
 
     # Creer les repertoires necessaires

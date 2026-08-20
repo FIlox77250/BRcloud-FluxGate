@@ -96,6 +96,70 @@ cohérence SYNPROXY), persistance au reboot, WAF, jails fail2ban, seuils conntra
 
 ---
 
+## Mettre à jour un serveur déjà déployé
+
+```bash
+cd ~/BRcloud-FluxGate
+
+# 1. Récupérer la nouvelle version
+git pull
+
+# 2. Compléter config.env sans perdre vos réglages
+bash scripts/migrate-config.sh
+
+# 3. Relire les clés ajoutées, surtout ADMIN_NETS / ADMIN_NETS6
+nano scripts/config.env
+bash scripts/check-config.sh
+
+# 4. Redéployer (les dépendances sont déjà installées)
+sudo bash scripts/deploy.sh
+
+# 5. Vérifier
+sudo bash scripts/validate.sh
+```
+
+`migrate-config.sh` ajoute uniquement les clés manquantes, avec leur commentaire
+d'origine, après avoir sauvegardé votre fichier. **Vos valeurs actuelles ne sont
+jamais écrasées.** Le script est idempotent : le relancer ne fait rien de plus.
+`--dry-run` montre ce qui serait ajouté sans écrire.
+
+> Si vous aviez cloné depuis un zip plutôt qu'avec git, remplacez l'étape 1 par
+> un `git clone` dans un répertoire neuf, puis recopiez-y votre ancien
+> `scripts/config.env` avant l'étape 2.
+
+### Ce que la mise à jour change sur le serveur
+
+| Élément | Effet |
+|---|---|
+| **OWASP CRS** | passe de la version installée à `CRS_VERSION` ; les anciennes règles sont déplacées en `rules.bak-<date>` |
+| **`crs-setup.conf`** | **conservé** — vos réglages (paranoia level, exclusions) ne sont pas touchés |
+| **Ruleset nftables** | entièrement remplacé ; les IP actuellement bloquées sont relevées puis réinjectées (leur expiration repart à la valeur par défaut du set) |
+| **fail2ban** | les jails basculent sur `banaction = fluxgate-nft` ; les bans de l'ancienne table `f2b` sont perdus au redémarrage du service |
+| **Limites systemd** | désormais appliquées à `SVC_NAME` ; **actives seulement après `systemctl restart <service>`** |
+| **sysctl** | ajout de BBR/fq, repli automatique en `cubic` si indisponible |
+
+L'ancien dossier `/etc/systemd/system/fluxgate-web.service.d/` peut subsister
+sans effet (il ne correspondait à aucun service réel). Le supprimer est sans
+risque :
+
+```bash
+sudo rm -rf /etc/systemd/system/fluxgate-web.service.d
+sudo systemctl daemon-reload
+```
+
+### Filet de sécurité
+
+Le redéploiement conserve les protections déjà en place :
+
+- sauvegarde du ruleset courant dans `/etc/nftables.conf.bak`, **rejouable tel quel**
+- rollback automatique programmé à 5 minutes (`at`), annulé si la connexion tient
+- interruption immédiate si la nouvelle configuration nftables est invalide,
+  règles courantes intactes
+
+En cas de doute, garder une seconde session SSH ouverte pendant l'opération.
+
+---
+
 ## Configuration centralisée
 
 Toutes les valeurs de `scripts/config.env` sont **réellement appliquées** par

@@ -392,6 +392,27 @@ if command -v nft &>/dev/null; then
     fi
     log_info "Configuration appliquee : SSH=${SSH_PORT} (${SSH_MODE}), ${NFT_SYN_RATE}/s par IP, ${NFT_HTTP_SYN_RATE}/s global HTTP(S)."
 
+    # --- Preserver les IP actuellement bloquees ---
+    # 'flush ruleset' recree les sets vides : sur un serveur deja en service,
+    # un redeploiement relacherait d'un coup tous les attaquants bannis.
+    # On releve les adresses avant, on les reinjecte apres.
+    SAVED_BLOCKED4=""
+    SAVED_BLOCKED6=""
+    if nft list set inet filter blocklist4 &>/dev/null; then
+        SAVED_BLOCKED4=$(nft list set inet filter blocklist4 2>/dev/null \
+            | sed -n '/elements = {/,/}/p' \
+            | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | sort -u | tr '\n' ' ')
+    fi
+    if nft list set inet filter blocklist6 &>/dev/null; then
+        SAVED_BLOCKED6=$(nft list set inet filter blocklist6 2>/dev/null \
+            | sed -n '/elements = {/,/}/p' \
+            | grep -oE '\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b' | sort -u | tr '\n' ' ')
+    fi
+    NB_SAVED=$(echo "$SAVED_BLOCKED4 $SAVED_BLOCKED6" | wc -w)
+    if [[ "$NB_SAVED" -gt 0 ]]; then
+        log_info "$NB_SAVED IP actuellement bloquee(s) : elles seront reinjectees apres application."
+    fi
+
     # Backup des regles actuelles avant application.
     # 'nft list ruleset' produit un dump SANS 'flush ruleset' en tete : le
     # rejouer tel quel empile les regles sur celles deja en place au lieu de
@@ -453,6 +474,20 @@ if command -v nft &>/dev/null; then
     if [[ -n "${ROLLBACK_JOB:-}" ]]; then
         atrm "$ROLLBACK_JOB" 2>/dev/null || true
         log_info "Rollback annule. Connexion OK apres application nftables."
+    fi
+
+    # --- Reinjecter les IP bloquees relevees avant le flush ---
+    # Le temps d'expiration restant n'est pas conservable : les entrees
+    # repartent sur le timeout par defaut du set (1h).
+    if [[ -n "${SAVED_BLOCKED4// }" ]] || [[ -n "${SAVED_BLOCKED6// }" ]]; then
+        RESTORED=0
+        for ip in $SAVED_BLOCKED4; do
+            nft add element inet filter blocklist4 "{ $ip }" 2>/dev/null && RESTORED=$((RESTORED+1))
+        done
+        for ip in $SAVED_BLOCKED6; do
+            nft add element inet filter blocklist6 "{ $ip }" 2>/dev/null && RESTORED=$((RESTORED+1))
+        done
+        log_info "$RESTORED IP bloquee(s) reinjectee(s) (expiration remise au defaut du set)."
     fi
 
     systemctl enable nftables 2>/dev/null || true
@@ -546,13 +581,20 @@ if command -v nginx &>/dev/null; then
        dpkg -l libnginx-mod-http-modsecurity 2>/dev/null | grep -q "^ii"; then
         log_info "ModSecurity detecte. Activation WAF..."
         
-        # --- Assurer la presence des regles OWASP CRS ---
-        if [[ ! -d /etc/modsecurity/crs/rules ]] || [[ -z "$(ls -A /etc/modsecurity/crs/rules 2>/dev/null)" ]]; then
-            log_warn "Regles OWASP CRS manquantes dans /etc/modsecurity/crs/rules."
+        # --- Regles OWASP CRS : installation ou mise a jour ---
+        # crs_needs_update compare la version reellement installee a la version
+        # cible. L'ancienne condition ne testait que l'existence du repertoire :
+        # sur un serveur deja deploye, le CRS n'etait donc jamais mis a jour.
+        if crs_needs_update /etc/modsecurity/crs; then
             if install_owasp_crs /etc/modsecurity/crs; then
                 log_info "OWASP CRS installe et verifie."
             else
-                log_error "Installation du CRS echouee : le WAF restera sans regles."
+                log_error "Installation du CRS echouee."
+                if [[ -d /etc/modsecurity/crs/rules ]]; then
+                    log_warn "Les regles precedentes restent en place."
+                else
+                    log_error "Le WAF restera sans regles."
+                fi
             fi
         fi
 

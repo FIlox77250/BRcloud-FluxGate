@@ -135,8 +135,56 @@ _crs_verify_gpg() {
 }
 
 # -----------------------------------------------------------------------------
+# crs_installed_version [repertoire]
+# Affiche la version du CRS installe, ou rien si indeterminable.
+# Les regles portent un tag "OWASP_CRS/x.y.z" : c'est la source la plus fiable,
+# le nom du repertoire ne dit rien de la version reellement en place.
+# -----------------------------------------------------------------------------
+crs_installed_version() {
+    local crs_dir="${1:-/etc/modsecurity/crs}"
+    [[ -d "$crs_dir/rules" ]] || return 1
+    grep -rhoE 'OWASP_CRS/[0-9]+\.[0-9]+\.[0-9]+' "$crs_dir/rules" 2>/dev/null \
+        | head -1 | cut -d/ -f2
+}
+
+# -----------------------------------------------------------------------------
+# crs_needs_update [repertoire]
+# Retourne 0 si une mise a jour est necessaire (absent, ou version differente
+# de CRS_VERSION). Sans cette verification, un serveur deja deploye conserve
+# indefiniment sa version du CRS : le repertoire existe, donc l'installation
+# etait purement et simplement sautee.
+# -----------------------------------------------------------------------------
+crs_needs_update() {
+    local crs_dir="${1:-/etc/modsecurity/crs}"
+
+    if [[ ! -d "$crs_dir/rules" ]] || [[ -z "$(ls -A "$crs_dir/rules" 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    local installed
+    installed=$(crs_installed_version "$crs_dir")
+
+    if [[ -z "$installed" ]]; then
+        log_warn "Version du CRS installe indeterminable : mise a jour proposee par securite."
+        return 0
+    fi
+
+    if [[ "$installed" != "$CRS_VERSION" ]]; then
+        log_info "CRS installe en v${installed}, version cible v${CRS_VERSION}."
+        return 0
+    fi
+
+    log_info "OWASP CRS deja en v${installed} (a jour)."
+    return 1
+}
+
+# -----------------------------------------------------------------------------
 # install_owasp_crs [repertoire_cible]
 # Telecharge, verifie et installe le CRS. Retourne 0 en cas de succes.
+#
+# En cas de mise a jour, l'ancien repertoire de regles est sauvegarde puis
+# remplace : laisser cohabiter des regles de deux versions differentes produit
+# des collisions d'identifiants et des faux positifs difficiles a diagnostiquer.
 # -----------------------------------------------------------------------------
 install_owasp_crs() {
     local crs_dir="${1:-/etc/modsecurity/crs}"
@@ -171,12 +219,23 @@ install_owasp_crs() {
         return 1
     fi
 
+    # Mise a jour : ecarter les anciennes regles plutot que d'ecraser par-dessus.
+    # Une regle supprimee en amont resterait sinon active indefiniment.
+    if [[ -d "$crs_dir/rules" ]] && [[ -n "$(ls -A "$crs_dir/rules" 2>/dev/null)" ]]; then
+        local old_backup
+        old_backup="${crs_dir}/rules.bak-$(date +%Y%m%d-%H%M%S)"
+        mv "$crs_dir/rules" "$old_backup"
+        log_info "Anciennes regles CRS deplacees vers $old_backup"
+    fi
+
     mkdir -p "$crs_dir"
     if ! tar xzf "${tmpdir}/${archive}" --strip-components=1 -C "$crs_dir"; then
         log_error "Echec de l'extraction de l'archive CRS."
         return 1
     fi
 
+    # crs-setup.conf contient les reglages de l'utilisateur (paranoia level,
+    # exclusions...) : ne jamais l'ecraser, seulement le creer s'il manque.
     if [[ -f "$crs_dir/crs-setup.conf.example" ]] && [[ ! -f "$crs_dir/crs-setup.conf" ]]; then
         cp "$crs_dir/crs-setup.conf.example" "$crs_dir/crs-setup.conf"
     fi

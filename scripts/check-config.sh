@@ -119,10 +119,64 @@ require_nft_set() {
 }
 
 # -----------------------------------------------------------------------------
+# 0. Detection d'un config.env anterieur a la v2.0
+# -----------------------------------------------------------------------------
+# Un fichier de la v1 ne contient pas les cles ajoutees depuis. Les traiter
+# comme des erreurs bloquerait toute mise a jour d'un serveur deja deploye :
+# on signale, on pointe vers migrate-config.sh, et on laisse les valeurs par
+# defaut prendre le relais.
+V2_KEYS=(ADMIN_NETS ADMIN_NETS6 NFT_HTTP_SYN_RATE NFT_HTTP_SYN_BURST
+         SYNPROXY_ENABLED SYNPROXY_MSS SYNPROXY_WSCALE
+         TCP_CONGESTION_CONTROL DEFAULT_QDISC F2B_USE_FLUXGATE_SETS
+         SVC_NAME SVC_MEMORY_HIGH SVC_LISTEN_PORT APACHE_MAX_REQUEST_WORKERS
+         CRS_VERSION CRS_SHA256 CRS_GPG_FINGERPRINT)
+
+MISSING_V2=()
+for k in "${V2_KEYS[@]}"; do
+    [[ -z "${!k:-}" ]] && MISSING_V2+=("$k")
+done
+
+LEGACY_CONFIG=false
+if [[ ${#MISSING_V2[@]} -gt 0 ]]; then
+    LEGACY_CONFIG=true
+    echo "--- Version de la configuration ---"
+    warn "${#MISSING_V2[@]} cle(s) de la v2.0 absente(s) de votre config.env."
+    warn "Fichier probablement issu d'une version anterieure."
+    echo "         Manquantes : ${MISSING_V2[*]}"
+    echo ""
+    echo "         Les valeurs par defaut seront utilisees pour ces cles."
+    echo "         Pour les ajouter en conservant vos reglages actuels :"
+    echo "             bash ${SCRIPT_DIR}/migrate-config.sh"
+    echo ""
+
+    # Valeurs de repli, afin que les controles suivants portent sur ce qui
+    # sera reellement applique par deploy.sh.
+    ADMIN_NETS="${ADMIN_NETS:-{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/24 \}}"
+    ADMIN_NETS6="${ADMIN_NETS6:-{ fc00::/7, fe80::/10 \}}"
+    NFT_HTTP_SYN_RATE="${NFT_HTTP_SYN_RATE:-50}"
+    NFT_HTTP_SYN_BURST="${NFT_HTTP_SYN_BURST:-100}"
+    SYNPROXY_ENABLED="${SYNPROXY_ENABLED:-false}"
+    SYNPROXY_MSS="${SYNPROXY_MSS:-1460}"
+    SYNPROXY_WSCALE="${SYNPROXY_WSCALE:-7}"
+    TCP_CONGESTION_CONTROL="${TCP_CONGESTION_CONTROL:-bbr}"
+    DEFAULT_QDISC="${DEFAULT_QDISC:-fq}"
+    F2B_USE_FLUXGATE_SETS="${F2B_USE_FLUXGATE_SETS:-true}"
+    SVC_NAME="${SVC_NAME:-nginx}"
+    SVC_MEMORY_HIGH="${SVC_MEMORY_HIGH:-1800M}"
+    SVC_LISTEN_PORT="${SVC_LISTEN_PORT:-8080}"
+    APACHE_MAX_REQUEST_WORKERS="${APACHE_MAX_REQUEST_WORKERS:-256}"
+    CRS_VERSION="${CRS_VERSION:-4.29.0}"
+    CRS_SHA256="${CRS_SHA256:-1aa1c5c8fc29e532d35293bcea36bf72de61db8f6ed4716a0f91ab14552b7fed}"
+    CRS_GPG_FINGERPRINT="${CRS_GPG_FINGERPRINT:-36006F0E0BA167832158821138EEACA1AB8A6E72}"
+fi
+
+# -----------------------------------------------------------------------------
 # 1. Variables obligatoires
 # -----------------------------------------------------------------------------
 echo "--- Variables obligatoires ---"
 
+# IFACE et les ports n'ont jamais eu de valeur par defaut sure : ils restent
+# strictement obligatoires, quelle que soit la version du fichier.
 for v in IFACE SSH_PORT HTTP_PORT HTTPS_PORT ADMIN_NETS ADMIN_NETS6; do
     require_set "$v" && reject_placeholder "$v"
 done
@@ -287,5 +341,13 @@ else
     echo -e "  Resultat : ${GREEN}configuration valide${NC}"
 fi
 echo -e "${CYAN}=============================================${NC}"
+
+if [[ "${LEGACY_CONFIG:-false}" == "true" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Rappel${NC} : config.env date d'une version anterieure."
+    echo "  Le deploiement fonctionnera avec les valeurs par defaut, mais"
+    echo "  completer le fichier rend les reglages visibles et modifiables :"
+    echo "      bash ${SCRIPT_DIR}/migrate-config.sh"
+fi
 echo ""
 exit 0
