@@ -108,6 +108,17 @@ HAS_GLOW=false && command -v glow &>/dev/null && HAS_GLOW=true
 # Import de la barre de progression native
 source "${SCRIPT_DIR}/progress_bar.sh" 2>/dev/null || true
 
+# Charger config.env s'il existe : permet d'epingler CRS_VERSION / CRS_SHA256
+# des l'installation, sans attendre le deploiement.
+if [[ -f "${SCRIPT_DIR}/config.env" ]]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/config.env"
+fi
+
+# Import de l'installation verifiee du CRS (sha256 + signature GPG)
+# shellcheck source=lib/crs.sh
+source "${SCRIPT_DIR}/lib/crs.sh" 2>/dev/null || log_warn "lib/crs.sh introuvable : installation CRS indisponible."
+
 print_banner() {
     local title="$1"
     if [[ "$HAS_FIGLET" == "true" ]]; then
@@ -442,17 +453,41 @@ show_progress 4 6 "Installation des systemes de detection (fail2ban/CrowdSec)...
 section "Etape 4/6 : CrowdSec"
 
 if [[ "$INSTALL_CROWDSEC" == "true" ]]; then
-    # Ajouter le depot CrowdSec si absent
+    # --- Ajout du depot CrowdSec (packagecloud) ---
+    # On n'utilise plus 'curl https://install.crowdsec.net | bash' : executer en
+    # root un script telecharge a la volee donne au serveur distant un controle
+    # total sur la machine, et le contenu peut changer sans qu'on le sache.
+    # On declare donc le depot signe nous-memes, avec les memes URL que le
+    # script officiel. Les paquets restent verifies par la signature du depot.
     if [[ "$OS_FAMILY" == "debian" ]]; then
         if [[ ! -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]]; then
-            log_info "Ajout du depot CrowdSec..."
-            curl -s https://install.crowdsec.net | bash >> "$LOG_FILE" 2>&1 || true
-            apt-get update >> "$LOG_FILE" 2>&1
+            log_info "Ajout du depot CrowdSec (cle signee packagecloud)..."
+            install -d -m 0755 /etc/apt/keyrings
+            CS_KEYRING="/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
+            if curl -fsSL "https://packagecloud.io/crowdsec/crowdsec/gpgkey" \
+                | gpg --dearmor --yes -o "$CS_KEYRING" 2>>"$LOG_FILE"; then
+                chmod 0644 "$CS_KEYRING"
+                echo "deb [signed-by=${CS_KEYRING}] https://packagecloud.io/crowdsec/crowdsec/any/ any main" \
+                    > /etc/apt/sources.list.d/crowdsec_crowdsec.list
+                apt-get update >> "$LOG_FILE" 2>&1
+                log_info "Depot CrowdSec ajoute et signe."
+            else
+                log_error "Echec de recuperation de la cle CrowdSec : depot non ajoute."
+            fi
         fi
     else
-        if ! rpm -q crowdsec-release &>/dev/null; then
-            log_info "Ajout du depot CrowdSec..."
-            curl -s https://install.crowdsec.net | bash >> "$LOG_FILE" 2>&1 || true
+        if [[ ! -f /etc/yum.repos.d/crowdsec_crowdsec.repo ]]; then
+            log_info "Ajout du depot CrowdSec (config packagecloud)..."
+            # Le fichier .repo est une donnee de configuration, pas du code
+            # execute : on le telecharge sans le passer a un interpreteur.
+            CS_OS=$(. /etc/os-release 2>/dev/null && echo "${ID:-rhel}")
+            CS_DIST=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-9}" | cut -d. -f1)
+            if curl -fsSL -o /etc/yum.repos.d/crowdsec_crowdsec.repo \
+                "https://packagecloud.io/install/repositories/crowdsec/crowdsec/config_file.repo?os=${CS_OS}&dist=${CS_DIST}&source=fluxgate" 2>>"$LOG_FILE"; then
+                log_info "Depot CrowdSec ajoute (${CS_OS} ${CS_DIST})."
+            else
+                log_error "Echec de recuperation du depot CrowdSec."
+            fi
         fi
     fi
 
@@ -528,20 +563,13 @@ if [[ "$INSTALL_WAF" == "true" ]]; then
         log_error "Echec installation ModSecurity."
     fi
 
-    # Telecharger OWASP CRS v4
-    CRS_VERSION="4.0.0"
+    # Telecharger OWASP CRS (version epinglee, sha256 + signature verifies)
     CRS_DIR="/etc/modsecurity/crs"
     if [[ ! -d "$CRS_DIR/rules" ]]; then
-        log_info "Telechargement OWASP CRS v${CRS_VERSION}..."
-        mkdir -p "$CRS_DIR"
-        curl -sL "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VERSION}.tar.gz" \
-            | tar xz --strip-components=1 -C "$CRS_DIR" 2>>"$LOG_FILE"
-        if [[ -f "$CRS_DIR/crs-setup.conf.example" ]]; then
-            cp "$CRS_DIR/crs-setup.conf.example" "$CRS_DIR/crs-setup.conf"
-            log_info "OWASP CRS v${CRS_VERSION} installe dans $CRS_DIR"
+        if install_owasp_crs "$CRS_DIR"; then
             INSTALLED+=("owasp-crs-v${CRS_VERSION}")
         else
-            log_error "Echec telechargement CRS."
+            log_error "Installation OWASP CRS echouee (integrite ou telechargement)."
             FAILED+=("owasp-crs")
         fi
     else

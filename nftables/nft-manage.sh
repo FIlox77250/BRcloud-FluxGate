@@ -21,15 +21,19 @@ Commands:
   counters            Afficher les compteurs de drop
   conntrack-stats     Statistiques conntrack
   emergency-drop-all  Mode urgence : drop tout sauf SSH admin
+  restore             Revenir au ruleset d'avant le mode urgence
 
 Exemples:
   $0 block 203.0.113.50 2h
+  $0 block 2001:db8::1 30m
   $0 counters
   $0 emergency-drop-all
+  $0 restore
 EOF
 }
 
 log_info()  { echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S') $*"; }
+log_warn()  { echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 log_error() { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 
 check_root() {
@@ -113,6 +117,34 @@ case "${1:-help}" in
 
     emergency-drop-all)
         check_root
+        # Le ruleset courant est sauvegarde AVANT le flush, avec son propre
+        # 'flush ruleset' en tete pour etre rejouable tel quel via 'restore'.
+        EMERG_BACKUP="/etc/nftables.conf.pre-emergency"
+        {
+            echo "#!/usr/sbin/nft -f"
+            echo "# Sauvegarde avant mode urgence du $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "flush ruleset"
+            nft list ruleset 2>/dev/null || true
+        } > "$EMERG_BACKUP"
+        chmod 600 "$EMERG_BACKUP"
+        log_info "Ruleset courant sauvegarde dans $EMERG_BACKUP"
+
+        # SSH restreint aux reseaux d'administration, conformement au nom de
+        # la commande. L'ancienne version acceptait le port SSH depuis
+        # n'importe quelle source, ce qui laissait la porte ouverte pendant
+        # precisement le moment ou on veut tout fermer.
+        if [[ -n "${ADMIN_NETS:-}" ]]; then
+            SSH_RULE_V4="tcp dport $SSH_PORT ip  saddr ${ADMIN_NETS} accept comment \"SSH urgence IPv4\""
+        else
+            log_warn "ADMIN_NETS vide : SSH IPv4 laisse ouvert a tous pour eviter le lockout."
+            SSH_RULE_V4="tcp dport $SSH_PORT accept comment \"SSH urgence (non restreint)\""
+        fi
+        if [[ -n "${ADMIN_NETS6:-}" ]]; then
+            SSH_RULE_V6="tcp dport $SSH_PORT ip6 saddr ${ADMIN_NETS6} accept comment \"SSH urgence IPv6\""
+        else
+            SSH_RULE_V6=""
+        fi
+
         log_info "MODE URGENCE : drop tout sauf SSH admin (port $SSH_PORT) !"
         nft flush ruleset
         nft -f - <<EMERGENCY
@@ -120,8 +152,10 @@ table inet emergency {
     chain input {
         type filter hook input priority 0; policy drop;
         iif "lo" accept
+        ct state invalid drop
         ct state established,related accept
-        tcp dport $SSH_PORT accept comment "SSH urgence"
+        $SSH_RULE_V4
+        $SSH_RULE_V6
         counter drop
     }
     chain forward {
@@ -133,6 +167,20 @@ table inet emergency {
 }
 EMERGENCY
         log_info "Mode urgence actif. Seul SSH (port $SSH_PORT) est ouvert."
+        log_info "Revenir a l'etat precedent : $0 restore"
+        ;;
+
+    restore)
+        check_root
+        EMERG_BACKUP="/etc/nftables.conf.pre-emergency"
+        if [[ ! -f "$EMERG_BACKUP" ]]; then
+            log_error "Aucune sauvegarde trouvee ($EMERG_BACKUP)."
+            log_error "Reappliquer la configuration standard : $0 apply"
+            exit 1
+        fi
+        log_info "Restauration du ruleset depuis $EMERG_BACKUP..."
+        nft -f "$EMERG_BACKUP"
+        log_info "Ruleset restaure."
         ;;
 
     help|--help|-h)

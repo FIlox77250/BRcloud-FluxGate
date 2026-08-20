@@ -1,0 +1,139 @@
+name: CI
+
+# Verifie ce qui ne peut pas etre teste depuis un poste Windows :
+# la syntaxe reelle de nftables, la qualite des scripts, et le fait que les
+# fins de ligne restent en LF (un script en CRLF ne demarre pas sur Linux).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: Analyse statique des scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Analyser tous les scripts
+        run: |
+          # SC1091 : les 'source' de fichiers generes a l'execution
+          #          (config.env) ne sont pas resolvables ici.
+          # SC2034 : variables de couleur declarees mais utilisees via echo -e.
+          shellcheck --external-sources --severity=warning \
+            --exclude=SC1091,SC2034 \
+            $(find . -name '*.sh' -not -path './.git/*')
+
+  nftables:
+    name: Syntaxe nftables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+
+      - name: Verifier le modele tel quel
+        run: sudo nft -c -f nftables/nftables.conf
+
+      - name: Verifier le rendu avec des valeurs personnalisees
+        run: |
+          cp nftables/nftables.conf /tmp/rendered.conf
+          # shellcheck disable=SC1091
+          source scripts/lib/nft-template.sh
+          SSH_PORT=2222 HTTP_PORT=8080 HTTPS_PORT=8443 \
+          ADMIN_NETS="{ 203.0.113.50/32 }" \
+          ADMIN_NETS6="{ 2001:db8::/32 }" \
+          NFT_SYN_RATE=250 NFT_SYN_BURST=400 \
+          NFT_HTTP_SYN_RATE=1500 NFT_HTTP_SYN_BURST=3000 \
+          SSH_MODE=strict SYNPROXY_ENABLED=false \
+            render_nftables_conf /tmp/rendered.conf
+          sudo nft -c -f /tmp/rendered.conf
+        shell: bash
+
+      - name: Verifier le rendu en mode SSH ouvert
+        run: |
+          cp nftables/nftables.conf /tmp/open.conf
+          source scripts/lib/nft-template.sh
+          SSH_MODE=open SYNPROXY_ENABLED=false render_nftables_conf /tmp/open.conf
+          sudo nft -c -f /tmp/open.conf
+        shell: bash
+
+      # L'expression 'synproxy' exige le module noyau nft_synproxy. Il est
+      # absent de certains noyaux (WSL2 notamment), et nft renvoie alors
+      # "Could not process rule: No such file or directory" — un defaut
+      # d'environnement, pas de configuration. L'etape reste visible mais ne
+      # fait pas echouer la CI ; le test de structure, lui, est bloquant et
+      # tourne dans le job "tests" (ordre des regles, marqueurs decommentes).
+      - name: Verifier le rendu avec SYNPROXY active
+        continue-on-error: true
+        run: |
+          cp nftables/nftables.conf /tmp/synproxy.conf
+          source scripts/lib/nft-template.sh
+          SYNPROXY_ENABLED=true SYNPROXY_MSS=1400 SYNPROXY_WSCALE=8 SSH_MODE=strict \
+            render_nftables_conf /tmp/synproxy.conf
+          if ! sudo modprobe nft_synproxy 2>/dev/null; then
+            echo "::notice::nft_synproxy indisponible sur ce runner, verification indicative"
+          fi
+          sudo nft -c -f /tmp/synproxy.conf
+        shell: bash
+
+  tests:
+    name: Tests de rendu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lancer la suite de tests
+        run: bash tests/test-templating.sh
+
+  config:
+    name: Validation de config.env.example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-config.sh doit accepter l'exemple fourni
+        run: |
+          cp scripts/config.env.example scripts/config.env
+          # L'interface eth0 de l'exemple n'existe pas sur le runner :
+          # on la remplace par une interface reellement presente pour que
+          # seule la coherence des valeurs soit testee.
+          IFACE_REAL=$(ip -br link | awk '$1 != "lo" {print $1; exit}')
+          sed -i "s/^IFACE=.*/IFACE=\"${IFACE_REAL}\"/" scripts/config.env
+          bash scripts/check-config.sh
+
+  lineendings:
+    name: Fins de ligne LF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aucun CRLF dans les fichiers deployes
+        run: |
+          # Un seul \r dans un script suffit a le rendre inexecutable sur
+          # Linux ("bad interpreter"). Le projet etant edite depuis Windows,
+          # ce garde-fou n'est pas theorique.
+          FOUND=0
+          while IFS= read -r f; do
+            if grep -qU $'\r' "$f"; then
+              echo "CRLF detecte : $f"
+              FOUND=1
+            fi
+          done < <(find . \( -name '*.sh' -o -name '*.conf' -o -name '*.yml' -o -name '*.yaml' -o -name '*.service' -o -name '*.socket' \) -not -path './.git/*')
+          exit $FOUND
+
+  yaml:
+    name: Syntaxe YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer yamllint
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq yamllint
+      - name: Verifier les YAML de monitoring et crowdsec
+        run: |
+          # relaxed : on veut detecter les erreurs de syntaxe, pas imposer
+          # un style de longueur de ligne aux configs upstream.
+          yamllint -d relaxed monitoring/ crowdsec/ .github/
