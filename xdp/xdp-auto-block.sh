@@ -43,11 +43,15 @@ log_info "Demarrage xdp-auto-block (seuil: ${CONN_THRESHOLD} conn/IP, intervalle
 while true; do
     # Capturer les IP sources avec le plus de connexions/paquets
     # conntrack -L donne les entrees de suivi d'etat
-    HIGH_RATE_IPS=$(conntrack -L 2>/dev/null \
+    # Le '| head -20' final est remplace par une here-string : si beaucoup
+    # d'IP depassent le seuil, head sort tot, awk se prend un SIGPIPE et
+    # 'set -o pipefail' fait echouer le service d'auto-blocage — exactement
+    # au moment ou il servirait le plus.
+    RANKED_IPS=$(conntrack -L 2>/dev/null \
         | grep -oP 'src=\K[0-9a-fA-F.:]+' \
         | sort | uniq -c | sort -rn \
-        | awk -v threshold="$CONN_THRESHOLD" '$1 > threshold {print $2}' \
-        | head -20)
+        | awk -v threshold="$CONN_THRESHOLD" '$1 > threshold {print $2}' || true)
+    HIGH_RATE_IPS=$(head -20 <<< "$RANKED_IPS")
 
     if [[ -n "$HIGH_RATE_IPS" ]]; then
         while IFS= read -r ip; do

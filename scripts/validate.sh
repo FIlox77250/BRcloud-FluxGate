@@ -88,33 +88,44 @@ echo ""
 echo "--- Pare-feu nftables ---"
 
 if command -v nft &>/dev/null; then
-    if nft list ruleset 2>/dev/null | grep -q "chain input"; then
+    # Le ruleset est releve UNE fois dans une variable, puis inspecte via des
+    # here-strings.
+    #
+    # Ne jamais faire 'nft list ruleset | grep -q ...' ici : grep -q sort des
+    # la premiere correspondance, nft se prend un SIGPIPE en continuant a
+    # ecrire, et 'set -o pipefail' transforme ca en echec de la condition. Sur
+    # un gros ruleset (CrowdSec, des milliers de lignes) le test echouait donc
+    # *parce que* la regle avait ete trouvee tot. Effet de bord agreable :
+    # une seule invocation au lieu d'une dizaine.
+    NFT_RULESET=$(nft list ruleset 2>/dev/null || true)
+
+    if grep -q "chain input" <<< "$NFT_RULESET"; then
         check_pass "nftables actif avec chain input"
 
-        nft list ruleset 2>/dev/null | grep -q "blocklist4" && \
+        grep -q "blocklist4" <<< "$NFT_RULESET" && \
             check_pass "Set blocklist4 present" || check_warn "Set blocklist4 absent"
 
-        nft list ruleset 2>/dev/null | grep -q "ct state invalid" && \
+        grep -q "ct state invalid" <<< "$NFT_RULESET" && \
             check_pass "Regle drop invalid presente" || check_warn "Regle drop invalid absente"
 
-        nft list ruleset 2>/dev/null | grep -q "limit rate" && \
+        grep -q "limit rate" <<< "$NFT_RULESET" && \
             check_pass "Rate limiting present" || check_warn "Pas de rate limiting nftables"
 
         # Parite IPv6 : un pare-feu qui ne filtre qu'en IPv4 laisse une porte
         # ouverte des que la machine a une adresse IPv6 routable.
-        nft list ruleset 2>/dev/null | grep -q "blocklist6" && \
+        grep -q "blocklist6" <<< "$NFT_RULESET" && \
             check_pass "Set blocklist6 present (parite IPv6)" || check_warn "Set blocklist6 absent"
 
         if ip -6 addr show scope global 2>/dev/null | grep -q "inet6"; then
             check_info "IPv6 globale detectee sur cette machine"
-            nft list ruleset 2>/dev/null | grep -q "ip6 saddr" && \
+            grep -q "ip6 saddr" <<< "$NFT_RULESET" && \
                 check_pass "Regles IPv6 presentes dans le ruleset" || \
                 check_fail "IPv6 active mais aucune regle ip6 saddr : trafic IPv6 non filtre"
         fi
 
         # SYNPROXY : les deux moities doivent etre presentes ou aucune.
-        HAS_SYNPROXY_PRE=$(nft list ruleset 2>/dev/null | grep -c "notrack" || true)
-        HAS_SYNPROXY_IN=$(nft list ruleset 2>/dev/null | grep -c "synproxy" || true)
+        HAS_SYNPROXY_PRE=$(grep -c "notrack" <<< "$NFT_RULESET" || true)
+        HAS_SYNPROXY_IN=$(grep -c "synproxy" <<< "$NFT_RULESET" || true)
         if [[ "$HAS_SYNPROXY_IN" -gt 0 ]] && [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
             check_pass "SYNPROXY actif (prerouting notrack + regle input)"
         elif [[ "$HAS_SYNPROXY_IN" -gt 0 ]] || [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
@@ -124,7 +135,7 @@ if command -v nft &>/dev/null; then
         fi
 
         # Un ruleset sans regle SSH d'aucune sorte = lockout au prochain reboot
-        if nft list ruleset 2>/dev/null | grep -q "dport ${SSH_PORT:-22}"; then
+        if grep -q "dport ${SSH_PORT:-22}" <<< "$NFT_RULESET"; then
             check_pass "Regle SSH presente pour le port ${SSH_PORT:-22}"
         else
             check_fail "Aucune regle nftables pour le port SSH ${SSH_PORT:-22} !"
@@ -244,7 +255,9 @@ if [[ -d /etc/modsecurity/crs/rules ]]; then
 
     # Version reellement installee vs version attendue
     if [[ -f /etc/modsecurity/crs/crs-setup.conf.example ]] || [[ -f /etc/modsecurity/crs/crs-setup.conf ]]; then
-        installed_ver=$(grep -rhoP 'version[/ ]OWASP_CRS/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/modsecurity/crs/rules/*.conf 2>/dev/null | head -1)
+        # Sans '| head -1' : voir la note SIGPIPE de la section nftables.
+        crs_matches=$(grep -rhoE 'OWASP_CRS/[0-9]+\.[0-9]+\.[0-9]+' /etc/modsecurity/crs/rules/ 2>/dev/null || true)
+        installed_ver=$(sed -n '1s|.*/||p' <<< "$crs_matches")
         if [[ -n "$installed_ver" ]]; then
             if [[ -n "${CRS_VERSION:-}" ]] && [[ "$installed_ver" != "${CRS_VERSION}" ]]; then
                 check_warn "CRS installe en v${installed_ver}, config.env attend v${CRS_VERSION}"

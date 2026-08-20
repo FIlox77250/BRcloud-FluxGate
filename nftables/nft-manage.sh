@@ -56,7 +56,11 @@ case "${1:-help}" in
         log_info "Application de la configuration nftables..."
         nft -f "$CONF_DIR/nftables.conf"
         log_info "Configuration appliquee."
-        nft list ruleset | head -5
+        # here-string plutot que 'nft list ruleset | head -5' : head sort au
+        # bout de 5 lignes, nft se prend un SIGPIPE en continuant d'ecrire et
+        # 'set -o pipefail' ferait echouer la commande sur un gros ruleset.
+        RULESET=$(nft list ruleset 2>/dev/null || true)
+        head -5 <<< "$RULESET"
         ;;
 
     show)

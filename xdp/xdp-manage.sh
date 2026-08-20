@@ -227,7 +227,10 @@ case "$CMD" in
     stats)
         log_info "Statistiques XDP sur $IFACE :"
         if command -v bpftool &>/dev/null; then
-            bpftool prog show 2>/dev/null | head -30
+            # here-string : bpftool peut lister bien plus de 30 lignes, et le
+            # SIGPIPE renvoye par head ferait echouer la commande sous pipefail.
+            BPF_PROGS=$(bpftool prog show 2>/dev/null || true)
+            head -30 <<< "$BPF_PROGS"
         else
             log_warn "bpftool non disponible pour les stats detaillees."
         fi

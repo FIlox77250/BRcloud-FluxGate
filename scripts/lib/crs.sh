@@ -143,8 +143,13 @@ _crs_verify_gpg() {
 crs_installed_version() {
     local crs_dir="${1:-/etc/modsecurity/crs}"
     [[ -d "$crs_dir/rules" ]] || return 1
-    grep -rhoE 'OWASP_CRS/[0-9]+\.[0-9]+\.[0-9]+' "$crs_dir/rules" 2>/dev/null \
-        | head -1 | cut -d/ -f2
+
+    # Pas de '| head -1' : head sort a la premiere ligne, grep se prend un
+    # SIGPIPE sur le reste, et les appelants tournent sous 'set -o pipefail'.
+    local matches
+    matches=$(grep -rhoE 'OWASP_CRS/[0-9]+\.[0-9]+\.[0-9]+' "$crs_dir/rules" 2>/dev/null || true)
+    [[ -n "$matches" ]] || return 1
+    sed -n '1s|.*/||p' <<< "$matches"
 }
 
 # -----------------------------------------------------------------------------
