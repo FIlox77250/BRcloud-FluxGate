@@ -333,6 +333,19 @@ shellcheck --severity=warning scripts/*.sh     # analyse statique
 sudo nft -c -f nftables/nftables.conf          # syntaxe du pare-feu
 ```
 
+Depuis un poste Windows, WSL suffit pour tout sauf SYNPROXY :
+
+```bash
+wsl -d Debian -u root -- bash -c 'cd /mnt/c/chemin/vers/BRcloud-FluxGate && \
+  nft -c -f nftables/nftables.conf && bash tests/test-templating.sh'
+```
+
+> Le noyau WSL2 ne fournit pas le module `nft_synproxy` : un rendu avec
+> SYNPROXY y échoue sur `Could not process rule: No such file or directory`,
+> y compris pour l'exemple officiel du wiki nftables. C'est une limite de
+> l'environnement, pas de la configuration — valider cette option sur une
+> vraie machine.
+
 La CI GitHub Actions rejoue tout cela à chaque push, plus une vérification que
 les fins de ligne restent en **LF** — un `.sh` en CRLF ne démarre pas sur Linux,
 et le projet est édité depuis Windows (`.gitattributes` verrouille le comportement).
