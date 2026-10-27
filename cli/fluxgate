@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# =============================================================================
+# BRCloud FluxGate - Commande d'exploitation "fluxgate"
+# =============================================================================
+# Point d'entree unique vers les scripts du projet. Installe par deploy.sh
+# en lien symbolique : /usr/local/sbin/fluxgate -> /opt/fluxgate/cli/fluxgate
+#
+#   fluxgate                  menu interactif (gum, sinon whiptail, sinon texte ;
+#                             FLUXGATE_UI=gum|whiptail|plain pour forcer)
+#   fluxgate <commande> ...   voir "fluxgate help"
+#
+# Le menu ne fait qu'appeler les memes commandes : tout ce qu'il propose
+# est aussi scriptable.
+# =============================================================================
+
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+NFT="${ROOT}/nftables/nft-manage.sh"
+XDP="${ROOT}/xdp/xdp-manage.sh"
+SCRIPTS="${ROOT}/scripts"
+
+usage() {
+    cat <<EOF
+Usage : fluxgate [commande] [options]
+
+Sans commande, et dans un terminal : menu interactif.
+
+Etat
+  status [-w]                 Tableau de bord (-w : rafraichi en continu)
+  validate [--no-active]      Verification complete de l'installation
+  check                       Valider config.env
+  metrics                     Metriques exportees vers Prometheus
+  logs [nftables|nginx|waf|fail2ban|crowdsec]
+                              Suivre un journal (nftables : compteurs)
+
+Bans
+  ban <IP|IPv6/64> [duree]    Bannir (defaut : 1h ; 30s, 15m, 2h, 1d)
+  unban <IP|IPv6/64>          Retirer un ban
+  bans                        Lister les bans nftables
+  xdp-ban <IP> [duree]        Bannir au niveau XDP (avant la pile reseau)
+  xdp-unban <IP>              Retirer un ban XDP
+
+Niveaux de protection
+  shield on [--for <duree>]   Seuils resserres, site joignable
+  shield off | status
+  emergency on [--for <duree>]
+                              Drop de tout sauf SSH admin (site coupe)
+  emergency off
+
+Configuration
+  apply                       Recharger /etc/nftables.conf (bans conserves)
+  deploy [--dry-run|--diff|--yes]
+  rollback [--yes]
+  migrate                     Ajouter a config.env les cles manquantes
+EOF
+}
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Cette commande doit etre lancee en root (sudo fluxgate $*)." >&2
+        exit 1
+    fi
+}
+
+follow_log() {
+    case "${1:-nftables}" in
+        # Le ruleset ne journalise pas ses drops (un flood saturerait le
+        # journal) : on suit les compteurs a la place.
+        nftables) watch -n 2 -- bash "$NFT" counters ;;
+        nginx)    tail -F /var/log/nginx/access.log /var/log/nginx/error.log ;;
+        waf)      tail -F /var/log/modsecurity/modsec_audit.log ;;
+        fail2ban) tail -F /var/log/fail2ban.log ;;
+        crowdsec) journalctl -u crowdsec -f ;;
+        *) echo "Journal inconnu : $1" >&2; exit 1 ;;
+    esac
+}
+
+run() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        status)    bash "${SCRIPTS}/status.sh" "$@" ;;
+        validate)  need_root "$cmd"; bash "${SCRIPTS}/validate.sh" "$@" ;;
+        check)     bash "${SCRIPTS}/check-config.sh" "$@" ;;
+        metrics)   need_root "$cmd"; bash "${ROOT}/monitoring/exporter/fluxgate-exporter.sh" --stdout | grep -v '^#' ;;
+        logs)      follow_log "$@" ;;
+        ban)       need_root "$cmd"; bash "$NFT" block "$@" ;;
+        unban)     need_root "$cmd"; bash "$NFT" unblock "$@" ;;
+        bans)      need_root "$cmd"; bash "$NFT" list-blocked ;;
+        xdp-ban)   need_root "$cmd"; bash "$XDP" block-ip "$@" ;;
+        xdp-unban) need_root "$cmd"; bash "$XDP" unblock-ip "$@" ;;
+        shield)    need_root "$cmd"; bash "$NFT" shield "$@" ;;
+        emergency)
+            need_root "$cmd"
+            case "${1:-}" in
+                on)  shift; bash "$NFT" emergency-drop-all "$@" ;;
+                off) bash "$NFT" restore ;;
+                *)   echo "Usage : fluxgate emergency on [--for <duree>] | off" >&2; exit 1 ;;
+            esac
+            ;;
+        apply)     need_root "$cmd"; bash "$NFT" apply ;;
+        deploy)    need_root "$cmd"; bash "${SCRIPTS}/deploy.sh" "$@" ;;
+        rollback)  need_root "$cmd"; bash "${SCRIPTS}/rollback.sh" "$@" ;;
+        migrate)   need_root "$cmd"; bash "${SCRIPTS}/migrate-config.sh" "$@" ;;
+        help|-h|--help) usage ;;
+        *) echo "Commande inconnue : $cmd" >&2; usage >&2; exit 1 ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Menu interactif : gum, sinon whiptail, sinon select
+# -----------------------------------------------------------------------------
+
+# FLUXGATE_UI=gum|whiptail|plain force l'interface (defaut : auto)
+UI="${FLUXGATE_UI:-auto}"
+if [[ "$UI" == "auto" ]]; then
+    if command -v gum &>/dev/null; then
+        UI=gum
+    elif command -v whiptail &>/dev/null; then
+        UI=whiptail
+    else
+        UI=plain
+    fi
+fi
+
+MENU_ITEMS=(
+    "status|Tableau de bord"
+    "validate|Verifier l'installation"
+    "bans|Lister les bans"
+    "ban|Bannir une IP"
+    "unban|Retirer un ban"
+    "shield-on|Activer le bouclier"
+    "shield-off|Desactiver le bouclier"
+    "emergency-on|MODE URGENCE (coupe le site)"
+    "emergency-off|Quitter le mode urgence"
+    "metrics|Metriques"
+    "logs|Suivre un journal"
+    "quit|Quitter"
+)
+
+ui_choose() {
+    local title="$1" i choice
+    shift
+    if [[ "$UI" == "gum" ]]; then
+        choice=$(printf '%s\n' "$@" | cut -d'|' -f2 | gum choose --header "$title") || return 1
+        for i in "$@"; do [[ "${i#*|}" == "$choice" ]] && { echo "${i%%|*}"; return 0; }; done
+        return 1
+    elif [[ "$UI" == "whiptail" ]]; then
+        local args=()
+        for i in "$@"; do args+=("${i%%|*}" "${i#*|}"); done
+        whiptail --title "FluxGate" --menu "$title" 22 70 14 "${args[@]}" 3>&1 1>&2 2>&3
+    else
+        local labels=()
+        for i in "$@"; do labels+=("${i#*|}"); done
+        PS3="${title} > "
+        select choice in "${labels[@]}"; do
+            [[ -n "$choice" ]] && { echo "${@:REPLY:1}" | cut -d'|' -f1; return 0; }
+        done
+        return 1
+    fi
+}
+
+ui_input() {
+    local prompt="$1" def="${2:-}"
+    if [[ "$UI" == "gum" ]]; then
+        gum input --header "$prompt" --value "$def"
+    elif [[ "$UI" == "whiptail" ]]; then
+        whiptail --title "FluxGate" --inputbox "$prompt" 10 70 "$def" 3>&1 1>&2 2>&3
+    else
+        local v
+        read -rp "$prompt [$def] " v
+        echo "${v:-$def}"
+    fi
+}
+
+ui_confirm() {
+    if [[ "$UI" == "gum" ]]; then
+        gum confirm "$1"
+    elif [[ "$UI" == "whiptail" ]]; then
+        whiptail --title "FluxGate" --yesno "$1" 12 70
+    else
+        local a
+        read -rp "$1 (y/N) " a
+        [[ "$a" =~ ^[yYoO]$ ]]
+    fi
+}
+
+pause() {
+    echo ""
+    read -rp "Entree pour revenir au menu..." _ || true
+}
+
+menu() {
+    local action ip ttl dur
+    while true; do
+        action=$(ui_choose "BRCloud FluxGate" "${MENU_ITEMS[@]}") || exit 0
+        clear 2>/dev/null || true
+        # Les erreurs d'une action ne doivent pas quitter le menu
+        case "$action" in
+            status)   ( run status ) || true; pause ;;
+            validate) ( run validate ) || true; pause ;;
+            bans)     ( run bans ) || true; pause ;;
+            ban)
+                ip=$(ui_input "IP ou reseau IPv6 /64 a bannir :") || continue
+                [[ -n "$ip" ]] || continue
+                ttl=$(ui_input "Duree (30s, 15m, 2h, 1d) :" "1h") || continue
+                ( run ban "$ip" "$ttl" ) || true; pause ;;
+            unban)
+                ip=$(ui_input "IP ou reseau IPv6 /64 a debannir :") || continue
+                [[ -n "$ip" ]] || continue
+                ( run unban "$ip" ) || true; pause ;;
+            shield-on)
+                dur=$(ui_input "Duree du bouclier (retour automatique) :" "30m") || continue
+                ( run shield on --for "$dur" ) || true; pause ;;
+            shield-off) ( run shield off ) || true; pause ;;
+            emergency-on)
+                ui_confirm "Le mode urgence coupe le site : seul le SSH depuis ADMIN_NETS passe. Continuer ?" || continue
+                dur=$(ui_input "Retour automatique apres (vide = manuel) :" "15m") || continue
+                if [[ -n "$dur" ]]; then
+                    ( run emergency on --for "$dur" ) || true
+                else
+                    ( run emergency on ) || true
+                fi
+                pause ;;
+            emergency-off) ( run emergency off ) || true; pause ;;
+            metrics)  ( run metrics ) || true; pause ;;
+            logs)
+                local src
+                src=$(ui_choose "Journal" "nftables|Compteurs nftables" "nginx|NGINX" \
+                      "waf|ModSecurity" "fail2ban|fail2ban" "crowdsec|CrowdSec") || continue
+                echo "Ctrl+C pour revenir au menu."
+                ( trap - INT; run logs "$src" ) || true ;;
+            quit|"") exit 0 ;;
+        esac
+    done
+}
+
+if [[ $# -eq 0 ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+        menu
+    else
+        usage
+    fi
+else
+    run "$@"
+fi

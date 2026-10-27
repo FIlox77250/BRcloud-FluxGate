@@ -10,6 +10,12 @@ global:
   evaluation_interval: 15s
   scrape_timeout: 10s
 
+# --- Alertmanager (voir monitoring/alertmanager/alertmanager.yml) ---
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["127.0.0.1:9093"]
+
 # --- Regles d'alerte ---
 rule_files:
   - "/etc/prometheus/rules/fluxgate-alerts.yml"
@@ -23,6 +29,8 @@ scrape_configs:
       - targets: ["127.0.0.1:9090"]
 
   # --- Node Exporter (metriques systeme : CPU, RAM, reseau, FD) ---
+  # Les metriques fluxgate_* arrivent par ce meme job, via le textfile
+  # collector (--collector.textfile.directory=/var/lib/prometheus/node-exporter).
   - job_name: "node"
     static_configs:
       - targets: ["127.0.0.1:9100"]
@@ -37,10 +45,14 @@ scrape_configs:
   #   static_configs:
   #     - targets: ["127.0.0.1:9113"]
 
-  # --- CrowdSec Prometheus metrics (si active) ---
-  - job_name: "crowdsec-bouncer"
-    static_configs:
-      - targets: ["127.0.0.1:60601"]
+  # --- CrowdSec (metriques de l'agent et de la LAPI) ---
+  # Le bouncer pare-feu n'expose pas de metriques par defaut : l'ancien job
+  # "crowdsec-bouncer" (127.0.0.1:60601) etait toujours DOWN et declenchait
+  # ServiceDown. Activer seulement si prometheus est actif dans
+  # /etc/crowdsec/config.yaml (listen_port 6060 par defaut).
+  # - job_name: "crowdsec"
+  #   static_configs:
+  #     - targets: ["127.0.0.1:6060"]
 
   # --- Application custom metrics (si expose) ---
   # - job_name: "app"

@@ -5,10 +5,14 @@
 # Copier vers /etc/crowdsec/acquis.yaml (ou /etc/crowdsec/acquis.d/)
 # =============================================================================
 
-# --- Logs SSH / auth ---
-filenames:
-  - /var/log/auth.log
-  - /var/log/syslog
+# --- Logs SSH : journal systemd ---
+# Debian 12+ et Ubuntu 24.04 n'ont plus de /var/log/auth.log sans rsyslog :
+# lire ce fichier ne remontait aucune tentative SSH. Deux filtres sur le
+# meme champ sont combines en OU (ssh.service Debian, sshd.service RHEL).
+source: journalctl
+journalctl_filter:
+  - "_SYSTEMD_UNIT=ssh.service"
+  - "_SYSTEMD_UNIT=sshd.service"
 labels:
   type: syslog
 ---
@@ -41,3 +45,12 @@ filenames:
   - /var/log/modsecurity/modsec_audit.log
 labels:
   type: modsecurity
+---
+
+# --- Logs Caddy (profil Caddy, journal JSON) ---
+# Necessite la collection : cscli collections install crowdsecurity/caddy
+# (installee par deploy.sh quand Caddy est detecte).
+filenames:
+  - /var/log/caddy/access.log
+labels:
+  type: caddy

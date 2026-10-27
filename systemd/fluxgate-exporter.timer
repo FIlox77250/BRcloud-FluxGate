@@ -1,0 +1,14 @@
+# =============================================================================
+# BRCloud FluxGate - Exporteur de metriques, toutes les minutes
+# =============================================================================
+
+[Unit]
+Description=FluxGate - metriques toutes les minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

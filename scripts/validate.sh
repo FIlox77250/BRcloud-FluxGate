@@ -3,18 +3,29 @@
 # BRCloud FluxGate - Script de Validation Post-Deploiement
 # =============================================================================
 # Verifie que tous les composants de la stack anti-DDoS sont fonctionnels.
-# Execution : sudo bash scripts/validate.sh
+# Execution : sudo bash scripts/validate.sh [--no-active]
+#   --no-active : sans les tests actifs (requetes HTTP reelles sur NGINX :
+#                 injection SQL -> 403 attendu, rafale -> 429 attendu)
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/config.env"
+CONFIG_FILE="${FLUXGATE_CONFIG:-${SCRIPT_DIR}/config.env}"
 
+# shellcheck source=lib/defaults.sh
+source "${SCRIPT_DIR}/lib/defaults.sh"
 if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    fluxgate_load_config "$CONFIG_FILE" || exit 1
+else
+    fluxgate_apply_defaults
 fi
+
+ACTIVE_TESTS=true
+case "${1:-}" in
+    --no-active) ACTIVE_TESTS=false ;;
+    -h|--help) echo "Usage: $0 [--no-active]"; exit 0 ;;
+esac
 
 IFACE="${IFACE:-eth0}"
 PASS=0
@@ -85,36 +96,31 @@ echo ""
 # =============================================================================
 # 2. nftables
 # =============================================================================
-echo "--- Pare-feu nftables ---"
+echo "--- Pare-feu nftables (table inet fluxgate) ---"
 
 if command -v nft &>/dev/null; then
-    if nft list ruleset 2>/dev/null | grep -q "chain input"; then
-        check_pass "nftables actif avec chain input"
+    if nft list table inet fluxgate &>/dev/null; then
+        check_pass "Table inet fluxgate chargee"
+        FG_RULES=$(nft list table inet fluxgate 2>/dev/null)
 
-        nft list ruleset 2>/dev/null | grep -q "blocklist4" && \
-            check_pass "Set blocklist4 present" || check_warn "Set blocklist4 absent"
-
-        nft list ruleset 2>/dev/null | grep -q "ct state invalid" && \
-            check_pass "Regle drop invalid presente" || check_warn "Regle drop invalid absente"
-
-        nft list ruleset 2>/dev/null | grep -q "limit rate" && \
-            check_pass "Rate limiting present" || check_warn "Pas de rate limiting nftables"
-
-        # Parite IPv6 : un pare-feu qui ne filtre qu'en IPv4 laisse une porte
-        # ouverte des que la machine a une adresse IPv6 routable.
-        nft list ruleset 2>/dev/null | grep -q "blocklist6" && \
-            check_pass "Set blocklist6 present (parite IPv6)" || check_warn "Set blocklist6 absent"
+        for s in blocklist4 blocklist6 blocklist6net allowlist4 allowlist6; do
+            grep -q "set ${s} " <<<"$FG_RULES" && check_pass "Set ${s} present" || check_warn "Set ${s} absent"
+        done
+        grep -q "policy drop" <<<"$FG_RULES" && check_pass "Politique input drop" || check_fail "Chaine input sans politique drop"
+        grep -q "ct state invalid" <<<"$FG_RULES" && check_pass "Regle drop invalid presente" || check_warn "Regle drop invalid absente"
+        grep -q "limit rate" <<<"$FG_RULES" && check_pass "Rate limiting par IP present" || check_warn "Pas de rate limiting nftables"
+        grep -q "ct count" <<<"$FG_RULES" && check_pass "Limite de connexions simultanees (ct count)" || check_warn "Pas de limite ct count"
 
         if ip -6 addr show scope global 2>/dev/null | grep -q "inet6"; then
             check_info "IPv6 globale detectee sur cette machine"
-            nft list ruleset 2>/dev/null | grep -q "ip6 saddr" && \
-                check_pass "Regles IPv6 presentes dans le ruleset" || \
+            grep -q "ip6 saddr" <<<"$FG_RULES" && \
+                check_pass "Regles IPv6 presentes" || \
                 check_fail "IPv6 active mais aucune regle ip6 saddr : trafic IPv6 non filtre"
         fi
 
         # SYNPROXY : les deux moities doivent etre presentes ou aucune.
-        HAS_SYNPROXY_PRE=$(nft list ruleset 2>/dev/null | grep -c "notrack" || true)
-        HAS_SYNPROXY_IN=$(nft list ruleset 2>/dev/null | grep -c "synproxy" || true)
+        HAS_SYNPROXY_PRE=$(grep -c "notrack" <<<"$FG_RULES" || true)
+        HAS_SYNPROXY_IN=$(grep -c "synproxy" <<<"$FG_RULES" || true)
         if [[ "$HAS_SYNPROXY_IN" -gt 0 ]] && [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
             check_pass "SYNPROXY actif (prerouting notrack + regle input)"
         elif [[ "$HAS_SYNPROXY_IN" -gt 0 ]] || [[ "$HAS_SYNPROXY_PRE" -gt 0 ]]; then
@@ -123,14 +129,39 @@ if command -v nft &>/dev/null; then
             check_info "SYNPROXY non active"
         fi
 
-        # Un ruleset sans regle SSH d'aucune sorte = lockout au prochain reboot
-        if nft list ruleset 2>/dev/null | grep -q "dport ${SSH_PORT:-22}"; then
-            check_pass "Regle SSH presente pour le port ${SSH_PORT:-22}"
+        # Une regle qui ACCEPTE le port SSH, pas seulement qui le mentionne
+        if nft -n list chain inet fluxgate input 2>/dev/null | grep -qE "tcp dport ${SSH_PORT} .*accept"; then
+            check_pass "Regle d'acceptation SSH pour le port ${SSH_PORT}"
         else
-            check_fail "Aucune regle nftables pour le port SSH ${SSH_PORT:-22} !"
+            check_fail "Aucune regle n'accepte le port SSH ${SSH_PORT} !"
+        fi
+
+        # Les sets doivent etre modifiables : c'est ce qu'utilisent fail2ban,
+        # CrowdSec et nft-manage.sh. Adresse de documentation, ban de 5 s.
+        if nft add element inet fluxgate blocklist4 "{ 192.0.2.254 timeout 5s }" 2>/dev/null \
+           && nft get element inet fluxgate blocklist4 "{ 192.0.2.254 }" &>/dev/null; then
+            nft delete element inet fluxgate blocklist4 "{ 192.0.2.254 }" 2>/dev/null || true
+            check_pass "Blocklist modifiable (ajout/retrait d'un ban de test)"
+        else
+            check_fail "Impossible d'ajouter un ban dans blocklist4"
+        fi
+
+        if nft list table inet fluxgate_emergency &>/dev/null; then
+            check_warn "Mode urgence ACTIF (nft-manage.sh restore)"
+        fi
+        if [[ -n "$(nft list chain inet fluxgate shield 2>/dev/null | grep -E 'drop|reject')" ]]; then
+            check_warn "Bouclier ACTIF (nft-manage.sh shield off)"
         fi
     else
-        check_fail "nftables sans regles input"
+        check_fail "Table inet fluxgate absente : pare-feu FluxGate non charge"
+    fi
+
+    if [[ -f /etc/nftables.conf ]]; then
+        if nft -c -f /etc/nftables.conf 2>/dev/null; then
+            check_pass "/etc/nftables.conf valide (rechargeable au boot)"
+        else
+            check_fail "/etc/nftables.conf invalide : le prochain boot echouera"
+        fi
     fi
 
     # Les regles doivent survivre au reboot
@@ -138,6 +169,11 @@ if command -v nft &>/dev/null; then
         check_pass "Service nftables active au demarrage"
     else
         check_fail "nftables non active au boot : les regles seront perdues au reboot"
+    fi
+    if systemctl is-enabled fluxgate-state.service &>/dev/null; then
+        check_pass "Bans persistants (fluxgate-state.service)"
+    else
+        check_warn "fluxgate-state.service inactif : les bans sont perdus au reboot"
     fi
 else
     check_warn "nft non disponible"
@@ -278,6 +314,60 @@ if ip link show dev "$IFACE" 2>/dev/null | grep -qi "xdp"; then
     check_pass "XDP attache sur $IFACE"
 else
     check_info "XDP non attache sur $IFACE"
+fi
+
+echo ""
+
+# =============================================================================
+# 7b. Tests actifs (requetes reelles sur NGINX local)
+# =============================================================================
+# Verifie le comportement, pas seulement la presence des regles : une
+# injection SQL doit etre bloquee (403), une rafale doit etre limitee (429).
+# Les requetes partent de 127.0.0.1 : elles testent NGINX et le WAF, pas
+# nftables (la boucle locale y est toujours acceptee).
+echo "--- Tests actifs (HTTP local) ---"
+
+http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
+
+if [[ "$ACTIVE_TESTS" != "true" ]]; then
+    check_info "Tests actifs ignores (--no-active)"
+elif ! command -v curl &>/dev/null; then
+    check_warn "curl absent : tests actifs impossibles"
+elif ! command -v nginx &>/dev/null || ! { systemctl is-active nginx &>/dev/null || pgrep -x nginx &>/dev/null; }; then
+    check_info "NGINX inactif : tests actifs ignores"
+else
+    BASE="http://127.0.0.1:${HTTP_PORT}"
+
+    code=$(http_code "${BASE}/health")
+    case "$code" in
+        200) check_pass "NGINX repond sur ${BASE} (/health = 200)" ;;
+        000) check_fail "Aucune reponse de ${BASE}" ;;
+        *)   check_warn "/health renvoie ${code}" ;;
+    esac
+
+    if grep -qE '^[[:space:]]*modsecurity[[:space:]]+on;' /etc/nginx/nginx.conf 2>/dev/null; then
+        code=$(http_code "${BASE}/?id=1%27%20OR%20%271%27%3D%271")
+        [[ "$code" == "403" ]] && check_pass "WAF : injection SQL bloquee (403)" \
+                               || check_fail "WAF : injection SQL non bloquee (code ${code})"
+        code=$(http_code "${BASE}/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+        [[ "$code" == "403" ]] && check_pass "WAF : XSS bloque (403)" \
+                               || check_fail "WAF : XSS non bloque (code ${code})"
+    else
+        check_info "ModSecurity inactif : tests WAF ignores"
+    fi
+
+    code=$(http_code -X TRACE "${BASE}/")
+    [[ "$code" == "403" || "$code" == "405" ]] && check_pass "Methode TRACE refusee (${code})" \
+                                               || check_warn "Methode TRACE acceptee (code ${code})"
+
+    # Rafale : nettement plus que burst + debit, envoyee en parallele.
+    n=$(( NGINX_BURST + NGINX_REQ_PER_SEC * 2 + 40 ))
+    codes=$(seq "$n" | xargs -P 32 -I{} curl -s -o /dev/null -m 5 -w '%{http_code}\n' "${BASE}/?fluxgate-burst={}" 2>/dev/null | sort | uniq -c || true)
+    if grep -qE '[[:space:]]429$' <<<"$codes"; then
+        check_pass "Rate limiting : rafale de ${n} requetes limitee ($(awk '$2 == 429 {print $1}' <<<"$codes") x 429)"
+    else
+        check_fail "Rate limiting : aucun 429 sur une rafale de ${n} requetes ($(tr -s ' \n' ' ' <<<"$codes"))"
+    fi
 fi
 
 echo ""

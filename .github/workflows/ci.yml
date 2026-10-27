@@ -91,6 +91,22 @@ jobs:
       - name: Lancer la suite de tests
         run: bash tests/test-templating.sh
 
+  runtime:
+    name: Tests d'execution (netns, nginx -t, fail2ban-regex, caddy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer les outils testes
+        run: |
+          sudo apt-get update -qq
+          # Les services installes par les paquets ne servent pas : seuls
+          # les binaires sont utilises (nginx -t, caddy validate...).
+          sudo apt-get install -y -qq nftables nginx fail2ban caddy openssl
+          sudo systemctl stop nginx caddy fail2ban 2>/dev/null || true
+      - name: Lancer les tests
+        # STRICT : un outil absent fait echouer le job au lieu d'etre saute
+        run: sudo FLUXGATE_TEST_STRICT=1 bash tests/test-runtime.sh
+
   config:
     name: Validation de config.env.example
     runs-on: ubuntu-latest
@@ -122,7 +138,8 @@ jobs:
               echo "CRLF detecte : $f"
               FOUND=1
             fi
-          done < <(find . \( -name '*.sh' -o -name '*.conf' -o -name '*.yml' -o -name '*.yaml' -o -name '*.service' -o -name '*.socket' \) -not -path './.git/*')
+          done < <(find . \( -name '*.sh' -o -name '*.conf' -o -name '*.yml' -o -name '*.yaml' -o -name '*.service' -o -name '*.socket' -o -name '*.timer' -o -name '*.caddy' \) -not -path './.git/*'; \
+                   echo ./cli/fluxgate; echo ./logrotate/fluxgate)
           exit $FOUND
 
   yaml:

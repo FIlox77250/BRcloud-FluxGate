@@ -1,0 +1,9 @@
+# Sauvegarde periodique des bans : un arret brutal (coupure, panique noyau)
+# ne passe pas par ExecStop de fluxgate-state.service.
+[Unit]
+Description=BRCloud FluxGate - sauvegarde periodique des bans
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fluxgate/nftables/fluxgate-state.sh save

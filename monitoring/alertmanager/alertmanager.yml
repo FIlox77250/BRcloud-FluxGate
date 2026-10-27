@@ -1,0 +1,67 @@
+# =============================================================================
+# BRCloud FluxGate - Alertmanager : notifications Discord
+# =============================================================================
+# Copier vers /etc/prometheus/alertmanager.yml (paquet Debian
+# prometheus-alertmanager), puis :
+#
+#   1. Discord : parametres du salon > Integrations > Webhooks > Nouveau
+#      webhook > Copier l'URL.
+#   2. Stocker l'URL hors de ce fichier (c'est un secret : quiconque la
+#      possede peut ecrire dans le salon) :
+#        install -m 640 -o root -g prometheus /dev/null /etc/prometheus/discord-webhook
+#        echo 'https://discord.com/api/webhooks/...' > /etc/prometheus/discord-webhook
+#   3. Verifier et recharger :
+#        amtool check-config /etc/prometheus/alertmanager.yml
+#        systemctl reload prometheus-alertmanager
+#   4. Tester l'envoi :
+#        amtool alert add FluxGateTest severity=warning --annotation=summary="Test FluxGate" \
+#          --alertmanager.url=http://127.0.0.1:9093
+#
+# Necessite un Alertmanager recent (discord_configs avec webhook_url_file).
+# Si amtool check-config refuse webhook_url_file, la version est trop
+# ancienne : remplacer par webhook_url: '<URL>' et passer le fichier en 640.
+# Alertmanager ecoute par defaut sur toutes les interfaces : le limiter a
+# 127.0.0.1 (ARGS="--web.listen-address=127.0.0.1:9093" dans
+# /etc/default/prometheus-alertmanager). Le pare-feu FluxGate ne laisse de
+# toute facon pas passer le port 9093.
+# =============================================================================
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: discord
+  group_by: ["alertname", "instance"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Critique (pare-feu absent, mode urgence, conntrack sature) : envoi
+    # immediat et rappel toutes les heures
+    - matchers: ['severity="critical"']
+      receiver: discord
+      group_wait: 10s
+      repeat_interval: 1h
+    # Information (bouclier actif) : un seul message, pas de rappel
+    - matchers: ['severity="info"']
+      receiver: discord
+      repeat_interval: 24h
+
+# Pendant le mode urgence, les alertes de charge sont attendues : seule
+# l'alerte d'urgence elle-meme est envoyee.
+inhibit_rules:
+  - source_matchers: ['alertname="FluxGateEmergencyActive"']
+    target_matchers: ['category=~"ddos|resources"']
+    equal: ["instance"]
+
+receivers:
+  - name: discord
+    discord_configs:
+      - webhook_url_file: /etc/prometheus/discord-webhook
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}[ALERTE]{{ else }}[RESOLU]{{ end }} {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})'
+        message: |-
+          {{ range .Alerts }}**{{ .Annotations.summary }}**
+          {{ .Annotations.description }}
+          Instance : {{ .Labels.instance }} - depuis {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ end }}

@@ -1,0 +1,11 @@
+# Mise a jour des listes de reputation (REPUTATION_LISTS) et des plages CDN
+# (CDN_MODE). Un telechargement rate conserve la derniere version valide.
+[Unit]
+Description=BRCloud FluxGate - mise a jour des listes de reputation et CDN
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=FLUXGATE_CONFIG=/opt/fluxgate/scripts/config.env
+ExecStart=/opt/fluxgate/nftables/fluxgate-lists.sh update

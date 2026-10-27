@@ -7,12 +7,13 @@
 
 [Unit]
 Description=BRCloud FluxGate - XDP Auto-Block Daemon
-After=network-online.target
-Wants=network-online.target
+After=network-online.target fluxgate-xdp.service
+Wants=network-online.target fluxgate-xdp.service
 ConditionPathExists=/opt/fluxgate/xdp/xdp-auto-block.sh
 
 [Service]
 Type=simple
+Environment=FLUXGATE_CONFIG=/opt/fluxgate/scripts/config.env
 ExecStart=/opt/fluxgate/xdp/xdp-auto-block.sh
 Restart=on-failure
 RestartSec=10s
@@ -22,15 +23,15 @@ CPUQuota=10%
 MemoryMax=256M
 LimitNOFILE=1024
 
-# Securite
-NoNewPrivileges=false
+# Securite (root requis : attachement XDP et conntrack)
+NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
 
 # Logs
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=fluxgate-xdp
+SyslogIdentifier=fluxgate-xdp-autoblock
 
 [Install]
 WantedBy=multi-user.target

@@ -50,7 +50,7 @@ groups:
           severity: critical
           category: ddos
         annotations:
-          summary: "Conntrack a {{ $value | printf \"%.0f\" }}% de la limite"
+          summary: "Conntrack a {{ $value | humanizePercentage }} de la limite"
           description: "La table conntrack approche de sa limite. Risque de drop de nouvelles connexions."
 
       # --- File descriptors proches du max ---
@@ -61,7 +61,7 @@ groups:
           severity: warning
           category: resources
         annotations:
-          summary: "File descriptors a {{ $value | printf \"%.0f\" }}%"
+          summary: "File descriptors a {{ $value | humanizePercentage }}"
           description: "Nombre de FD alloues proche du maximum systeme."
 
       # --- Memoire faible ---
@@ -130,3 +130,87 @@ groups:
       #     severity: warning
       #   annotations:
       #     summary: "Taux d'erreurs HTTP 5xx > 5%"
+
+  # ---------------------------------------------------------------------------
+  # Metriques propres a FluxGate (monitoring/exporter/fluxgate-exporter.sh,
+  # via le textfile collector de node_exporter)
+  # ---------------------------------------------------------------------------
+  - name: fluxgate_protection_alerts
+    rules:
+
+      # --- Table nftables absente : le serveur n'est plus protege ---
+      - alert: FluxGateFirewallNotLoaded
+        expr: fluxgate_nft_table_loaded == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: protection
+        annotations:
+          summary: "Table nftables inet fluxgate absente"
+          description: "Le pare-feu FluxGate n'est pas charge sur {{ $labels.instance }}. Verifier : systemctl status nftables ; nft list table inet fluxgate"
+
+      # --- Exporteur arrete : les autres alertes FluxGate sont aveugles ---
+      - alert: FluxGateExporterStale
+        expr: time() - fluxgate_exporter_last_run_timestamp_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+          category: protection
+        annotations:
+          summary: "Metriques FluxGate non mises a jour depuis 5 min"
+          description: "Verifier : systemctl status fluxgate-exporter.timer"
+
+      # --- Mode urgence : seul le SSH admin passe, le site est coupe ---
+      - alert: FluxGateEmergencyActive
+        expr: fluxgate_emergency_active == 1
+        for: 0m
+        labels:
+          severity: critical
+          category: protection
+        annotations:
+          summary: "Mode urgence FluxGate actif"
+          description: "Tout le trafic hors SSH admin est bloque sur {{ $labels.instance }}. Sortie : fluxgate emergency off"
+
+      # --- Bouclier actif (information) ---
+      - alert: FluxGateShieldActive
+        expr: fluxgate_shield_active == 1
+        for: 0m
+        labels:
+          severity: info
+          category: protection
+        annotations:
+          summary: "Bouclier FluxGate actif"
+          description: "Seuils resserres en place sur {{ $labels.instance }} ; retour automatique apres SHIELD_DURATION."
+
+      # --- Vague de bans : attaque applicative ou brute force distribue ---
+      - alert: FluxGateBanSpike
+        expr: sum by (instance) (fluxgate_banned_ips) - sum by (instance) (fluxgate_banned_ips offset 10m) > 50
+        for: 0m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "+{{ $value }} IP bannies en 10 minutes"
+          description: "Forte hausse des bans nftables (fail2ban/CrowdSec/manuels)."
+
+      # --- Rate limiting NGINX tres sollicite ---
+      - alert: FluxGateHigh429Rate
+        expr: rate(fluxgate_nginx_429_total[5m]) > 20
+        for: 5m
+        labels:
+          severity: warning
+          category: ddos
+        annotations:
+          summary: "NGINX renvoie {{ $value | printf \"%.0f\" }} reponses 429/s"
+          description: "Flood HTTP probable, ou limites trop basses pour le trafic legitime (NGINX_REQ_PER_SEC)."
+
+      # --- WAF tres sollicite ---
+      - alert: FluxGateWAFBlocks
+        expr: rate(fluxgate_waf_blocked_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          category: attack
+        annotations:
+          summary: "ModSecurity bloque {{ $value | printf \"%.1f\" }} requetes/s"
+          description: "Scan de vulnerabilites probable, ou faux positifs apres une mise a jour de l'application."

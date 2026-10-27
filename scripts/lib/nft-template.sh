@@ -18,6 +18,10 @@
 #   SSH_PORT HTTP_PORT HTTPS_PORT
 #   ADMIN_NETS ADMIN_NETS6
 #   NFT_SYN_RATE NFT_SYN_BURST NFT_HTTP_SYN_RATE NFT_HTTP_SYN_BURST
+#   NFT_SSH_RATE NFT_SSH_BURST NFT_HTTP_CONN_LIMIT
+#   NFT_FORWARD_POLICY (drop|accept ; "auto" est resolu par deploy.sh)
+#   EXTRA_TCP_PORTS EXTRA_UDP_PORTS ALLOWLIST4 ALLOWLIST6
+#   CDN_MODE (off|cloudflare)
 #   SYNPROXY_ENABLED SYNPROXY_MSS SYNPROXY_WSCALE
 #   SSH_MODE (open|strict)
 # =============================================================================
@@ -44,6 +48,34 @@ _nft_require_match() {
 }
 
 # -----------------------------------------------------------------------------
+# _nft_list <valeur>
+# Transforme "25, 587 1000-2000" en "25, 587, 1000-2000" : config.env accepte
+# virgules et espaces comme separateurs, nft n'accepte que les virgules.
+# -----------------------------------------------------------------------------
+_nft_list() {
+    local raw="${1//,/ }" out="" item
+    for item in $raw; do
+        out+="${out:+, }${item}"
+    done
+    printf '%s' "$out"
+}
+
+# -----------------------------------------------------------------------------
+# _nft_toggle_block <fichier> <MARQUEUR> <on|off> <indentation>
+# Decommente (on) ou commente (off) les lignes situees entre
+# "# --- <MARQUEUR> BEGIN ---" et "# --- <MARQUEUR> END ---", marqueurs exclus.
+# -----------------------------------------------------------------------------
+_nft_toggle_block() {
+    local file="$1" marker="$2" state="$3" ind="$4"
+    local range="/^${ind}# --- ${marker} BEGIN ---\$/,/^${ind}# --- ${marker} END ---\$/"
+    if [[ "$state" == "on" ]]; then
+        sed -i "${range}{/BEGIN ---\$/!{/END ---\$/!s/^${ind}# /${ind}/}}" "$file"
+    else
+        sed -i "${range}{/BEGIN ---\$/!{/END ---\$/!{/^${ind}# /!s/^${ind}/${ind}# /}}}" "$file"
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # render_nftables_conf <fichier>
 # Applique la configuration en place. Retourne 1 si une ancre a disparu.
 # -----------------------------------------------------------------------------
@@ -62,10 +94,24 @@ render_nftables_conf() {
     local syn_burst="${NFT_SYN_BURST:-150}"
     local http_rate="${NFT_HTTP_SYN_RATE:-50}"
     local http_burst="${NFT_HTTP_SYN_BURST:-100}"
+    local ssh_rate="${NFT_SSH_RATE:-5}"
+    local ssh_burst="${NFT_SSH_BURST:-10}"
+    local conn_limit="${NFT_HTTP_CONN_LIMIT:-256}"
+    local forward_policy="${NFT_FORWARD_POLICY:-drop}"
+    local cdn_mode="${CDN_MODE:-off}"
     local synproxy="${SYNPROXY_ENABLED:-false}"
     local synproxy_mss="${SYNPROXY_MSS:-1460}"
     local synproxy_wscale="${SYNPROXY_WSCALE:-7}"
     local ssh_mode="${SSH_MODE:-strict}"
+    local extra_tcp extra_udp allow4 allow6
+    extra_tcp=$(_nft_list "${EXTRA_TCP_PORTS:-}")
+    extra_udp=$(_nft_list "${EXTRA_UDP_PORTS:-}")
+    allow4=$(_nft_list "${ALLOWLIST4:-}")
+    allow6=$(_nft_list "${ALLOWLIST6:-}")
+
+    # "auto" se decide sur la machine cible (deploy.sh). Ici, faute
+    # d'information, on retombe sur la valeur la plus stricte.
+    [[ "$forward_policy" == "auto" ]] && forward_policy="drop"
 
     # --- Ports ---
     _nft_require_match "$conf" '^define SSH_PORT' "define SSH_PORT" || rc=1
@@ -79,24 +125,74 @@ render_nftables_conf() {
     sed -i "s|^define ADMIN_NETS  = .*|define ADMIN_NETS  = ${admin_nets}|"   "$conf"
     sed -i "s|^define ADMIN_NETS6 = .*|define ADMIN_NETS6 = ${admin_nets6}|"  "$conf"
 
-    # --- Rate limiting per-IP ---
+    # --- Rate limiting SYN per-IP (tous ports) ---
     # Ancre = le nom du set dynamique. Le commentaire de la regle est sur la
     # ligne de continuation, il ne peut donc pas servir d'ancre.
     _nft_require_match "$conf" '@syn_flood4 \{ ip saddr limit rate over' "rate limit per-IP IPv4" || rc=1
-    _nft_require_match "$conf" '@syn_flood6 \{ ip6 saddr limit rate over' "rate limit per-IP IPv6" || rc=1
+    _nft_require_match "$conf" '@syn_flood6 \{ ip6 saddr .* limit rate over' "rate limit per-IP IPv6" || rc=1
     sed -i "/@syn_flood[46]/s|limit rate over [0-9]\+/second burst [0-9]\+ packets|limit rate over ${syn_rate}/second burst ${syn_burst} packets|" "$conf"
 
-    # --- Rate limiting global HTTP(S) ---
-    # Ancre = ligne COMMENCANT par "limit rate" : les limites ICMP sont
-    # precedees d'une accolade fermante sur la meme ligne, elles sont donc
-    # exclues par cette ancre.
-    _nft_require_match "$conf" '^[[:space:]]+limit rate [0-9]+/second burst [0-9]+ packets accept' "rate limit HTTP(S) global" || rc=1
-    sed -i "s|^\([[:space:]]*\)limit rate [0-9]\+/second burst [0-9]\+ packets accept|\1limit rate ${http_rate}/second burst ${http_burst} packets accept|" "$conf"
+    # --- Rate limiting SSH par IP ---
+    _nft_require_match "$conf" '@ssh_meter4 \{ ip saddr limit rate [0-9]+/minute' "rate limit SSH IPv4" || rc=1
+    _nft_require_match "$conf" '@ssh_meter6 \{ ip6 saddr .* limit rate [0-9]+/minute' "rate limit SSH IPv6" || rc=1
+    sed -i "/@ssh_meter[46]/s|limit rate [0-9]\+/minute burst [0-9]\+ packets|limit rate ${ssh_rate}/minute burst ${ssh_burst} packets|" "$conf"
+
+    # --- Rate limiting HTTP(S) par IP ---
+    # L'ancienne limite etait globale : 50 SYN/s pour tous les visiteurs
+    # reunis, qu'un seul attaquant suffisait a epuiser. Ancre = nom du set.
+    _nft_require_match "$conf" '@http_meter4 \{ ip saddr limit rate over' "rate limit HTTP(S) IPv4" || rc=1
+    _nft_require_match "$conf" '@http_meter6 \{ ip6 saddr .* limit rate over' "rate limit HTTP(S) IPv6" || rc=1
+    sed -i "/@http_meter[46]/s|limit rate over [0-9]\+/second burst [0-9]\+ packets|limit rate over ${http_rate}/second burst ${http_burst} packets|" "$conf"
+
+    # --- Connexions simultanees par IP (0 = desactive) ---
+    _nft_require_match "$conf" '# --- CONNLIMIT BEGIN ---' "bloc CONNLIMIT" || rc=1
+    _nft_require_match "$conf" '@http_conn4 \{ ip saddr ct count over' "connlimit IPv4" || rc=1
+    if [[ "$conn_limit" == "0" ]]; then
+        _nft_toggle_block "$conf" "CONNLIMIT" off "        "
+    else
+        sed -i "/@http_conn[46]/s|ct count over [0-9]\+|ct count over ${conn_limit}|" "$conf"
+    fi
+
+    # --- Politique forward ---
+    _nft_require_match "$conf" 'policy [a-z]+; # @FORWARD_POLICY@' "politique forward" || rc=1
+    sed -i "s|policy [a-z]\+; # @FORWARD_POLICY@|policy ${forward_policy}; # @FORWARD_POLICY@|" "$conf"
+
+    # --- Ports supplementaires ---
+    _nft_require_match "$conf" '# @EXTRA_TCP_PORTS@' "ports TCP supplementaires" || rc=1
+    _nft_require_match "$conf" '# @EXTRA_UDP_PORTS@' "ports UDP supplementaires" || rc=1
+    if [[ -n "$extra_tcp" ]]; then
+        sed -i "s|^\([[:space:]]*\)# @EXTRA_TCP_PORTS@|\1tcp dport { ${extra_tcp} } ct state new accept comment \"EXTRA_TCP_PORTS\"|" "$conf"
+    fi
+    if [[ -n "$extra_udp" ]]; then
+        sed -i "s|^\([[:space:]]*\)# @EXTRA_UDP_PORTS@|\1udp dport { ${extra_udp} } accept comment \"EXTRA_UDP_PORTS\"|" "$conf"
+    fi
+
+    # --- Allowlist ---
+    _nft_require_match "$conf" '# @ALLOWLIST4@' "allowlist IPv4" || rc=1
+    _nft_require_match "$conf" '# @ALLOWLIST6@' "allowlist IPv6" || rc=1
+    if [[ -n "$allow4" ]]; then
+        sed -i "s|^\([[:space:]]*\)# @ALLOWLIST4@|\1elements = { ${allow4} }|" "$conf"
+    fi
+    if [[ -n "$allow6" ]]; then
+        sed -i "s|^\([[:space:]]*\)# @ALLOWLIST6@|\1elements = { ${allow6} }|" "$conf"
+    fi
+
+    # --- Mode CDN : HTTP(S) reserve aux plages du CDN ---
+    if [[ "$cdn_mode" != "off" ]]; then
+        _nft_require_match "$conf" '# --- CDN BEGIN ---' "bloc CDN" || rc=1
+        _nft_toggle_block "$conf" "CDN" on "        "
+    fi
 
     # --- Mode SSH ---
+    # open   : SSH accessible a tous, limite par IP (lignes admin inutiles)
+    # strict : SSH reserve a ADMIN_NETS. Les lignes "ouvertes" doivent alors
+    #          etre neutralisees, sinon elles acceptent n'importe qui (a
+    #          5/min) et le mode strict ne restreint rien.
     if [[ "$ssh_mode" == "open" ]]; then
         sed -i 's|^\([[:space:]]*\)tcp dport \$SSH_PORT ip  saddr \$ADMIN_NETS |\1# tcp dport $SSH_PORT ip  saddr $ADMIN_NETS |' "$conf"
         sed -i 's|^\([[:space:]]*\)tcp dport \$SSH_PORT ip6 saddr \$ADMIN_NETS6 |\1# tcp dport $SSH_PORT ip6 saddr $ADMIN_NETS6 |' "$conf"
+    else
+        sed -i 's|^\([[:space:]]*\)tcp dport \$SSH_PORT ct state new update @ssh_meter|\1# tcp dport $SSH_PORT ct state new update @ssh_meter|' "$conf"
     fi
 
     # --- SYNPROXY ---
@@ -104,8 +200,8 @@ render_nftables_conf() {
         _nft_require_match "$conf" '# --- SYNPROXY PRE BEGIN ---' "bloc SYNPROXY prerouting" || rc=1
         _nft_require_match "$conf" '# --- SYNPROXY IN BEGIN ---'  "bloc SYNPROXY input" || rc=1
         # Decommenter les deux blocs, marqueurs exclus
-        sed -i '/^    # --- SYNPROXY PRE BEGIN ---$/,/^    # --- SYNPROXY PRE END ---$/{/BEGIN ---$/!{/END ---$/!s/^    # /    /}}' "$conf"
-        sed -i '/^        # --- SYNPROXY IN BEGIN ---$/,/^        # --- SYNPROXY IN END ---$/{/BEGIN ---$/!{/END ---$/!s/^        # /        /}}' "$conf"
+        _nft_toggle_block "$conf" "SYNPROXY PRE" on "    "
+        _nft_toggle_block "$conf" "SYNPROXY IN"  on "        "
         sed -i "s/synproxy mss [0-9]\+ wscale [0-9]\+/synproxy mss ${synproxy_mss} wscale ${synproxy_wscale}/" "$conf"
     fi
 

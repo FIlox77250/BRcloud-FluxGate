@@ -1,0 +1,11 @@
+[Unit]
+Description=BRCloud FluxGate - mise a jour quotidienne des listes
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
