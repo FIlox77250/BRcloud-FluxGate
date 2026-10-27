@@ -1,0 +1,33 @@
+# =============================================================================
+# BRCloud FluxGate - Rotation des journaux
+# =============================================================================
+# Installe par deploy.sh dans /etc/logrotate.d/fluxgate.
+# Verifier : logrotate -d /etc/logrotate.d/fluxgate
+# =============================================================================
+
+# Journaux de deploy.sh / install.sh : ecrits en ajout a chaque execution,
+# aucun processus ne les garde ouverts.
+/var/log/fluxgate/*.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root adm
+}
+
+# Journal d'audit ModSecurity : il grossit vite pendant un scan ou une
+# attaque applicative. Le connecteur NGINX garde le fichier ouvert et ne le
+# rouvre pas sur signal de facon fiable : copytruncate evite d'ecrire dans
+# un fichier supprime (quelques lignes peuvent etre perdues pendant la copie).
+/var/log/modsecurity/modsec_audit.log /var/log/modsecurity/modsec_debug.log {
+    daily
+    rotate 14
+    maxsize 200M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

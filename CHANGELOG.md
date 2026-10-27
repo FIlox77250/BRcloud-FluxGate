@@ -5,6 +5,122 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 
 ---
 
+## [2.1.0] — 2026-10-26
+
+Corrections issues de la revue du 26 octobre 2026 : d'abord ce qui pouvait
+bloquer l'accès au serveur ou couper une protection sans prévenir, puis les
+défauts de conception, puis les ajouts.
+
+### Corrigé — risques de lockout et protections désactivées
+
+- **Le filet anti-lockout ne vérifiait rien.** Le rollback `at` était annulé
+  après un `sleep 3`, alors que la session en cours, déjà établie, survit à
+  presque toutes les erreurs de règle. `deploy.sh` exige désormais qu'une
+  **nouvelle** session SSH écrive un jeton aléatoire sous 120 s ; sinon
+  l'ancien pare-feu est restauré. Avec `--yes`, une auto-vérification prend le
+  relais (port SSH accepté, IP de session ni bannie ni hors `ADMIN_NETS`).
+- **`nft-manage.sh apply` chargeait le modèle brut** (port SSH 22, `ADMIN_NETS`
+  d'exemple). Il recharge maintenant `/etc/nftables.conf`, rendu avec vos
+  valeurs, en conservant les bans. La section *reverse proxy* du README, qui
+  conseillait la même copie, est corrigée.
+- **Le WAF se désactivait un déploiement sur deux.** La détection cherchait
+  `^modsecurity on;` alors que la ligne insérée est indentée : la directive
+  était ajoutée en double, `nginx -t` échouait, et le repli retirait toutes les
+  lignes `modsecurity`.
+- **HTTPS ne s'activait jamais en locale C.** `ls /etc/letsencrypt/live | head -1`
+  renvoyait `README`. Seuls les répertoires contenant `fullchain.pem` et
+  `privkey.pem` sont retenus ; `NGINX_CERT_NAME` permet de choisir.
+- **Limites globales SSH et HTTP.** 50 SYN/s usurpés suffisaient à couper le
+  site pour tout le monde, et le bruit des scanners à bloquer SSH en mode
+  ouvert. Toutes les limites sont désormais **par IP**, et par **/64** en IPv6.
+- **ICMPv6 :** Neighbor Discovery, RA et Packet Too Big partageaient le seau des
+  pings ; un ping flood coupait l'IPv6. Seul `echo-request` est limité.
+
+### Changé — table dédiée
+
+- **Table `inet fluxgate` au lieu de `flush ruleset`.** Chaque déploiement
+  effaçait les règles de Docker, du bouncer CrowdSec, de wg-quick ou de
+  Proxmox. FluxGate supprime et recrée uniquement sa table ; l'ancienne
+  `inet filter` de la v2.0 est migrée. La politique forward devient
+  configurable (`NFT_FORWARD_POLICY=auto|drop|accept`, `auto` détectant Docker,
+  libvirt, LXC et `ip_forward`).
+
+### Corrigé — autres bugs
+
+- `/api/login` perdait sa limite stricte : le `sed` des `burst` s'appliquait à
+  tout le fichier (5 devenait 50). Les endpoints sensibles ont leur propre
+  `NGINX_LOGIN_BURST`.
+- `crs-setup-override.conf` n'était jamais inclus. Il l'est, ses IDs sortent
+  de la plage 900xxx réservée au CRS, et son rate-limit (dont l'`expirevar`
+  rejoué à chaque requête aurait renvoyé un 429 à tout visiteur actif) est
+  retiré au profit de NGINX.
+- fail2ban (jail SSH) et CrowdSec lisaient `/var/log/auth.log`, absent sur
+  Debian 12/13 : passage à `backend = systemd` et à la source `journalctl`.
+- Le rollback ne survivait pas au reboot : `/etc/nftables.conf` est remis dans
+  sa version d'origine (ou remplacé par un ruleset vide).
+- Conflit de port entre l'API locale CrowdSec et `NGINX_UPSTREAM_PORT` (8080) :
+  `CROWDSEC_LAPI_PORT=8081`, et `check-config.sh` détecte les collisions.
+- `xdp-auto-block.sh` comptait les deux `src=` de chaque entrée conntrack (vos
+  serveurs amont pouvaient être bannis), n'avait pas de liste blanche et
+  ignorait `XDP_BLOCK_TIMEOUT` (bans permanents). Les trois sont corrigés, et
+  `xdp-manage.sh` ne remplace plus `/usr/sbin/xdp-loader`.
+- `status.sh` affichait « 0 0 » et ne comptait que `blocklist4`.
+- Les alertes en pourcentage affichaient 1 % au lieu de 85 %
+  (`humanizePercentage`).
+- Le job Prometheus `crowdsec-bouncer` déclenchait un `ServiceDown` permanent
+  sans CrowdSec : remplacé par un job `crowdsec` commenté.
+- `listen … http2` (obsolète depuis nginx 1.25.1) n'est plus émis sur les
+  versions récentes ; `ssl_stapling` retiré (Let's Encrypt a arrêté OCSP) ;
+  HSTS `preload` devient optionnel (`HSTS_PRELOAD=false`).
+
+### Changé — conception
+
+- `CPUQuota=80%` (80 % d'**un** cœur) devient `SVC_CPU_QUOTA=auto`
+  (nproc × 80 %).
+- Le shaping `tc` n'utilise plus TBF (burst trop petit, et il remplaçait le
+  `fq` dont BBR a besoin) : `cake` ou `fq maxrate` (`TC_QDISC`).
+- `ALLOWED_METHODS` pilote NGINX et le CRS : `OPTIONS` (CORS) n'est plus
+  bloqué, et `PUT PATCH DELETE` s'activent pour une API REST ou WebDAV.
+- fail2ban reçoit `ignoreip` avec `ADMIN_NETS` : plus d'auto-bannissement.
+- `config.env` est refusé s'il n'appartient pas à root avec les droits `600`.
+- Valeurs par défaut centralisées dans `scripts/lib/defaults.sh` (elles étaient
+  copiées dans quatre fichiers).
+
+### Ajouté
+
+- `EXTRA_TCP_PORTS` / `EXTRA_UDP_PORTS`, liste blanche `ALLOWLIST4/6` (avant
+  limites et bans), limite de connexions simultanées par IP
+  (`NFT_HTTP_CONN_LIMIT`, `ct count`).
+- Listes de réputation (`REPUTATION_LISTS` : Spamhaus DROP, FireHOL level1…)
+  rafraîchies par `fluxgate-lists.timer`.
+- `CDN_MODE=cloudflare` : HTTP/HTTPS réservés aux plages Cloudflare, vraie IP
+  restaurée dans NGINX.
+- **Bouclier** (`shield on --for 30m`) : seuils resserrés, site joignable,
+  retour automatique. `emergency-drop-all --for 15m` revient aussi seul.
+- **Profil Caddy** (`caddy/`) : snippets d'en-têtes, méthodes et journal JSON
+  pour le Caddy des dépôts, Coraza + OWASP CRS et caddy-ratelimit quand le
+  binaire les contient (`caddy/build-caddy.sh`), collection CrowdSec
+  `crowdsecurity/caddy`. Le Caddyfile de l'utilisateur n'est pas modifié.
+- **Exporteur FluxGate** (textfile collector, chaque minute) : compteurs par
+  règle nftables, IP bannies, réputation, bouclier, urgence, XDP, fail2ban,
+  CrowdSec, 429 NGINX et blocages WAF. Nouvelles alertes de protection et
+  **Alertmanager vers Discord**.
+- **Commande `fluxgate`** (`/usr/local/sbin/fluxgate`) avec menu
+  gum / whiptail / texte.
+- `deploy.sh --dry-run`, `--diff` et `--yes`.
+- Persistance : bans sauvegardés et restaurés avec leur durée restante, XDP
+  rechargé au boot (`fluxgate-xdp.service`).
+- `validate.sh` teste en réel : injection SQL → 403, rafale → 429
+  (`--no-active` pour s'en passer).
+- `migrate-config.sh` complète un ancien `config.env` sans écraser de valeur.
+- logrotate pour `/var/log/fluxgate` et les journaux ModSecurity.
+- `tests/test-runtime.sh` et job CI `runtime` : ruleset chargé dans des
+  espaces de noms réseau avec trafic réel par veth (HTTP, SSH strict, ban,
+  urgence), nft-manage, exporteur et CLI, `nginx -t` des rendus HTTP/HTTPS,
+  `fail2ban-regex`, `caddy validate`, `check-config.sh`.
+
+---
+
 ## [2.0.0] — 2026-08-20
 
 Reprise du projet après une période sans maintenance. Le socle multi-couche est

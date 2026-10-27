@@ -14,10 +14,11 @@ Paquet entrant
       │
       ├─ [1] XDP / eBPF          DROP ultra-rapide (dizaines de Mpps)
       ├─ [2] Kernel Tuning       SYN cookies, backlogs, conntrack, BBR/fq
-      ├─ [3] nftables L3/L4      Sets dynamiques, rate limit SYN, SYNPROXY (opt.)
+      ├─ [3] nftables L3/L4      Table inet fluxgate, limites par IP (/64 en IPv6),
+      │                          réputation, bouclier, SYNPROXY (opt.)
       ├─ [4] systemd             Limites CPU/RAM/FD, connexions max par IP source
-      ├─ [5] Nginx / Apache      Leaky bucket, anti-slowloris, 429
-      ├─ [6] WAF ModSecurity     OWASP CRS — filtrage SQLi & XSS
+      ├─ [5] Nginx / Apache / Caddy  Leaky bucket, anti-slowloris, 429
+      ├─ [6] WAF ModSecurity     OWASP CRS (Coraza en profil Caddy) — SQLi & XSS
       └─ [7] Application         Isolation cgroups (CPU, RAM max)
 ```
 
@@ -82,8 +83,20 @@ sudo bash scripts/deploy.sh
 
 > 🔒 **Anti-lockout SSH** — le script détecte l'IP de ta session active (IPv4 **ou**
 > IPv6) et propose de l'injecter à chaud dans le bon set admin si elle n'est pas
-> whitelistée. Un rollback automatique de 5 min (`at`) réinitialise le pare-feu
-> si la connexion coupe.
+> whitelistée. Après le chargement du pare-feu, il affiche un jeton et attend
+> **120 s** qu'une **nouvelle** session SSH l'écrive
+> (`echo <jeton> | sudo tee /run/fluxgate/confirm`). La session en cours ne
+> prouve rien : déjà établie, elle survit à presque toutes les erreurs de règle.
+> Sans confirmation (ou touche `r`), l'ancien pare-feu est restauré ; le job
+> `at` de 5 min reste le dernier filet si le script lui-même est coupé.
+
+Options de `deploy.sh` :
+
+| Option      | Effet |
+|-------------|-------|
+| `--dry-run` | rend le pare-feu et les sysctl dans un répertoire temporaire et vérifie le ruleset (`nft -c`), sans rien modifier |
+| `--diff`    | comme `--dry-run`, avec le diff par rapport aux fichiers installés |
+| `--yes`     | aucune question (Ansible, cloud-init) : `config.env` fait foi, et la confirmation SSH est remplacée par une auto-vérification (port SSH accepté, IP de session ni bannie ni hors `ADMIN_NETS` en mode strict) |
 
 ### 5. Valider
 
@@ -93,6 +106,9 @@ sudo bash scripts/validate.sh
 
 Diagnostic complet : sysctl, congestion BBR, nftables (dont parité IPv6 et
 cohérence SYNPROXY), persistance au reboot, WAF, jails fail2ban, seuils conntrack.
+Il teste aussi **en réel** : une injection SQL envoyée à NGINX doit recevoir un
+403 du WAF, et une rafale de requêtes doit déclencher des 429. `--no-active`
+saute ces requêtes.
 
 ---
 
@@ -133,7 +149,7 @@ jamais écrasées.** Le script est idempotent : le relancer ne fait rien de plus
 |---|---|
 | **OWASP CRS** | passe de la version installée à `CRS_VERSION` ; les anciennes règles sont déplacées en `rules.bak-<date>` |
 | **`crs-setup.conf`** | **conservé** — vos réglages (paranoia level, exclusions) ne sont pas touchés |
-| **Ruleset nftables** | entièrement remplacé ; les IP actuellement bloquées sont relevées puis réinjectées (leur expiration repart à la valeur par défaut du set) |
+| **Ruleset nftables** | FluxGate vit désormais dans sa propre table `inet fluxgate`, supprimée puis recréée : les tables de Docker, du bouncer CrowdSec, de wg-quick ou de Proxmox ne sont plus effacées. L'ancienne table `inet filter` de FluxGate ≤ 2.0 est retirée. Les bans sont relevés puis réinjectés |
 | **fail2ban** | les jails basculent sur `banaction = fluxgate-nft` ; les bans de l'ancienne table `f2b` sont perdus au redémarrage du service |
 | **Limites systemd** | désormais appliquées à `SVC_NAME` ; **actives seulement après `systemctl restart <service>`** |
 | **sysctl** | ajout de BBR/fq, repli automatique en `cubic` si indisponible |
@@ -152,11 +168,14 @@ sudo systemctl daemon-reload
 Le redéploiement conserve les protections déjà en place :
 
 - sauvegarde du ruleset courant dans `/etc/nftables.conf.bak`, **rejouable tel quel**
-- rollback automatique programmé à 5 minutes (`at`), annulé si la connexion tient
+- confirmation obligatoire depuis une nouvelle session SSH (voir *Déployer*),
+  et rollback `at` à 5 minutes en dernier recours
 - interruption immédiate si la nouvelle configuration nftables est invalide,
   règles courantes intactes
+- `--dry-run` / `--diff` pour voir les changements avant de les appliquer
 
-En cas de doute, garder une seconde session SSH ouverte pendant l'opération.
+Garder une seconde session SSH ouverte pendant l'opération : elle sert à la
+confirmation.
 
 ---
 
@@ -178,46 +197,85 @@ désormais **échouer** le déploiement au lieu de partir en silence sur les dé
 bash tests/test-templating.sh
 ```
 
-### Deux seuils à ne pas confondre
+Les valeurs par défaut sont définies **une seule fois**, dans
+`scripts/lib/defaults.sh`, et partagées par tous les scripts. `config.env` est
+exécuté en root : les scripts refusent de le charger s'il n'appartient pas à
+root avec les droits `600` (`sudo chown root: scripts/config.env && sudo chmod 600 scripts/config.env`).
 
-| Variable                 | Portée                    | Effet si trop bas                     |
-|--------------------------|---------------------------|---------------------------------------|
-| `NFT_SYN_RATE`           | **par IP source**         | bloque un attaquant ciblé             |
-| `NFT_HTTP_SYN_RATE`      | **global, toutes IP**     | jette des visiteurs légitimes en pic  |
+### Toutes les limites sont par IP
 
-Le défaut de `NFT_HTTP_SYN_RATE` (50/s) convient à un petit site. Sur un site
-fréquenté, montez à 500–2000, ou passez par un CDN.
+| Variable              | Portée                         | Défaut      |
+|-----------------------|--------------------------------|-------------|
+| `NFT_SYN_RATE`        | SYN tous ports, par IP         | 100/s       |
+| `NFT_HTTP_SYN_RATE`   | nouvelles connexions HTTP(S)   | 50/s        |
+| `NFT_SSH_RATE`        | nouvelles connexions SSH       | 5/min       |
+| `NFT_HTTP_CONN_LIMIT` | connexions HTTP(S) simultanées | 256 (`ct count`) |
+
+Une limite **globale** se retourne contre le serveur : 50 SYN usurpés par
+seconde suffisaient à couper le site pour tout le monde, et le bruit des
+scanners à empêcher l'accès SSH. Chaque limite est donc tenue par IP source,
+et par **préfixe /64 en IPv6** (un attaquant dispose d'au moins un /64 et peut
+changer d'adresse à l'infini). Même agrégation dans NGINX et fail2ban.
+
+En ICMPv6, Neighbor Discovery, Router Advertisement et Packet Too Big passent
+sans limite : seul `echo-request` est limité. Un ping flood ne coupe plus l'IPv6.
+
+### Ports, liste blanche, réputation
+
+| Variable                              | Rôle |
+|---------------------------------------|------|
+| `EXTRA_TCP_PORTS` / `EXTRA_UDP_PORTS` | ports ouverts en plus (mail, WireGuard, jeux…), ex. `"25 465 587 993"` |
+| `ALLOWLIST4` / `ALLOWLIST6`           | IP ou réseaux qui passent **avant** les limites et les bans (monitoring, autres serveurs, VPN) |
+| `REPUTATION_LISTS`                    | `spamhaus-drop`, `spamhaus-drop6`, `firehol-level1` ou URL https, chargées dans un set et rafraîchies chaque jour (`fluxgate-lists.timer`) |
+| `NFT_FORWARD_POLICY`                  | `auto` (accept si Docker, libvirt, LXC ou `ip_forward=1`), `drop` ou `accept` |
+| `ALLOWED_METHODS`                     | méthodes HTTP acceptées par NGINX **et** le CRS (`PUT PATCH DELETE` pour une API REST ou WebDAV) |
+| `CROWDSEC_LAPI_PORT`                  | 8081 par défaut : 8080 entrait en conflit avec `NGINX_UPSTREAM_PORT` |
 
 ---
 
 ## Exploitation
 
-### Tableau de bord temps réel
+### Commande `fluxgate`
+
+`deploy.sh` installe `/usr/local/sbin/fluxgate`, point d'entrée unique vers les
+scripts. Sans argument, dans un terminal, elle ouvre un menu (gum, sinon
+whiptail, sinon menu texte ; `FLUXGATE_UI=gum|whiptail|plain` pour forcer).
 
 ```bash
-sudo bash scripts/status.sh -w        # mode watch
-sudo bash scripts/status.sh -w -n 1   # rafraîchissement 1s
+fluxgate status -w                    # tableau de bord temps réel
+sudo fluxgate validate                # vérification complète
+sudo fluxgate ban 203.0.113.50 2h     # IPv4, IPv6, ou un /64 entier
+sudo fluxgate ban 2001:db8:1::/64 1d
+sudo fluxgate unban 203.0.113.50
+sudo fluxgate bans                    # manuels + fail2ban + CrowdSec
+sudo fluxgate xdp-ban 198.51.100.7 1h # drop avant la pile réseau
+sudo fluxgate metrics                 # ce qui part vers Prometheus
+fluxgate logs nginx                   # nftables | nginx | waf | fail2ban | crowdsec
+sudo fluxgate deploy --diff
 ```
 
-### Gestion à chaud du pare-feu
+`fluxgate help` liste tout. Les scripts restent utilisables directement
+(`nftables/nft-manage.sh`, `scripts/status.sh`…).
 
-```bash
-# Bloquer une IP 2 heures (IPv4 ou IPv6, détection automatique)
-sudo bash nftables/nft-manage.sh block 203.0.113.50 2h
-sudo bash nftables/nft-manage.sh block 2001:db8::1 30m
+### Niveaux de protection
 
-# Débloquer
-sudo bash nftables/nft-manage.sh unblock 203.0.113.50
+| Niveau     | Commande                                  | Effet |
+|------------|-------------------------------------------|-------|
+| normal     | —                                         | seuils de `config.env` |
+| bouclier   | `sudo fluxgate shield on --for 30m`       | seuils resserrés (`SHIELD_*`), **site joignable** ; retour automatique |
+| urgence    | `sudo fluxgate emergency on --for 15m`    | drop de tout sauf SSH depuis `ADMIN_NETS` : **site coupé** |
 
-# Lister les IPs bloquées (manuel + fail2ban + CrowdSec, tout au même endroit)
-sudo bash nftables/nft-manage.sh list-blocked
+`shield off` et `emergency off` reviennent à la normale avant l'échéance. Sans
+`--for`, le bouclier dure `SHIELD_DURATION` (0 = jusqu'à `shield off`) et
+l'urgence jusqu'à `emergency off`. Le retour automatique passe par un timer
+`systemd-run`, il survit donc à la fermeture de la session.
 
-# Mode urgence : tout bloquer sauf SSH depuis ADMIN_NETS
-sudo bash nftables/nft-manage.sh emergency-drop-all
+### Persistance
 
-# Revenir à l'état d'avant l'urgence
-sudo bash nftables/nft-manage.sh restore
-```
+Les bans manuels et ceux de fail2ban sont sauvegardés toutes les 5 minutes et à
+l'arrêt (`fluxgate-state-save.timer`, `fluxgate-state.service`), puis réinjectés
+au démarrage avec leur durée restante. Le programme XDP est rechargé au boot par
+`fluxgate-xdp.service` quand `XDP_ENABLED=true`.
 
 ### Bans unifiés
 
@@ -259,56 +317,117 @@ Prérequis noyau (déjà fournis par `sysctl/99-fluxgate-hardening.conf`) :
 
 ## Derrière un CDN (Cloudflare…)
 
-Le rate-limiting L7 ciblerait les IP du CDN et bloquerait tous les visiteurs d'un coup.
+Sans réglage, le rate-limiting L7 viserait les IP du CDN et bloquerait tous les
+visiteurs d'un coup.
 
-1. Whitelister les plages IP du CDN dans nftables.
-2. Décommenter la section **OPTION CDN** dans `nginx/nginx-fluxgate.conf` :
-
-```nginx
-set_real_ip_from 103.21.244.0/22;
-real_ip_header CF-Connecting-IP;
-real_ip_recursive on;
+```bash
+# Dans config.env
+CDN_MODE=cloudflare
 ```
+
+`deploy.sh` récupère alors les plages Cloudflare (rafraîchies chaque jour par
+`fluxgate-lists.timer`) et :
+
+- n'ouvre HTTP/HTTPS **qu'à ces plages** dans nftables : impossible de
+  contourner le CDN en visant l'IP d'origine ;
+- génère `fluxgate-realip.conf` (`set_real_ip_from` + `CF-Connecting-IP`) pour
+  que NGINX, fail2ban et CrowdSec voient la vraie IP du visiteur ;
+- en profil Caddy, utilise `CF-Connecting-IP` comme clé de limite de débit.
 
 ---
 
 ## Utilisation avec un reverse proxy (Caddy, Nginx, Traefik…)
 
-Si tu utilises un reverse proxy comme Caddy sur le même hôte, les ports 80 et 443
-doivent être explicitement autorisés dans nftables — FluxGate applique un `policy drop`
-par défaut sur toutes les entrées.
-
-La config `nftables/nftables.conf` inclut déjà les règles HTTP/HTTPS, mais si tu
-constates que le reverse proxy ne répond pas après déploiement, c'est probablement
-que l'ancienne config `/etc/nftables.conf` n'a pas été mise à jour.
-
-**Solution :**
+Les ports `HTTP_PORT` / `HTTPS_PORT` sont ouverts par le ruleset quel que soit
+le serveur web. Si le reverse proxy ne répond pas après déploiement, recharger
+**la configuration installée**, qui contient tes valeurs :
 
 ```bash
-sudo cp ~/BRcloud-FluxGate/nftables/nftables.conf /etc/nftables.conf
-sudo nft -f /etc/nftables.conf
-
-# Vérifier que les ports sont bien ouverts
-sudo nft list ruleset | grep -E "80|443"
-
-# Persister au reboot
-sudo systemctl enable nftables
+sudo fluxgate apply            # recharge /etc/nftables.conf, bans conservés
+sudo nft list chain inet fluxgate input | grep -E 'dport'
 ```
 
-> ⚠️ Ne pas oublier d'activer `systemctl enable nftables` pour que les règles
-> survivent à un redémarrage du serveur. `validate.sh` le vérifie désormais.
+> ⚠️ Ne **jamais** copier `nftables/nftables.conf` du dépôt vers
+> `/etc/nftables.conf` : c'est un modèle, avec le port SSH 22 et les
+> `ADMIN_NETS` d'exemple. Si ton SSH écoute ailleurs, tu es bloqué dehors.
+> Seul `deploy.sh` produit le fichier rendu.
+
+### Profil Caddy
+
+Quand Caddy est installé et NGINX absent, `deploy.sh` installe des snippets dans
+`/etc/caddy/fluxgate.caddy` **sans toucher à ton Caddyfile** :
+
+```caddy
+import /etc/caddy/fluxgate.caddy
+
+exemple.fr {
+    import fluxgate
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+| Snippet         | Contenu | Prérequis |
+|-----------------|---------|-----------|
+| `fluxgate_base` | en-têtes de sécurité, HSTS, 10 Mo max, `ALLOWED_METHODS` (405 sinon), journal JSON | Caddy des dépôts |
+| `fluxgate_waf`  | Coraza + OWASP CRS, limite de débit `NGINX_REQ_PER_SEC × 10 + NGINX_BURST` par 10 s | modules coraza-caddy et caddy-ratelimit |
+| `fluxgate`      | les deux | — |
+
+Le Caddy des dépôts n'a ni WAF ni limite de débit : `deploy.sh` le détecte et
+réduit alors `fluxgate` à la partie de base. Pour compiler un binaire complet
+(Go ≥ 1.22, versions figées dans le script, retour arrière par
+`update-alternatives`) :
+
+```bash
+sudo bash caddy/build-caddy.sh
+sudo fluxgate deploy
+```
+
+Le profil est validé par `caddy validate` avant installation. Si CrowdSec est
+présent, la collection `crowdsecurity/caddy` est installée et le journal
+`/var/log/caddy/access.log` ajouté aux sources.
+
+---
+
+## Monitoring et alertes
+
+| Élément | Rôle |
+|---------|------|
+| `monitoring/exporter/fluxgate-exporter.sh` | lancé chaque minute (`fluxgate-exporter.timer`), écrit `fluxgate.prom` pour le textfile collector de node_exporter |
+| `monitoring/prometheus/fluxgate-alerts.yml` | alertes système + protection (pare-feu absent, urgence active, pic de bans, taux de 429, blocages WAF, exporteur muet) |
+| `monitoring/alertmanager/alertmanager.yml` | routage vers **Discord** |
+
+Métriques exposées : paquets/octets par règle nftables commentée, IP bannies
+par set, entrées de réputation, état du bouclier et de l'urgence, bans XDP,
+fail2ban et CrowdSec, total des 429 NGINX et des blocages ModSecurity. Elles
+arrivent par le job `node` existant : rien à ajouter côté Prometheus.
+
+```bash
+sudo fluxgate metrics                                  # aperçu
+sudo install -m 640 -o root -g prometheus /dev/null /etc/prometheus/discord-webhook
+echo 'https://discord.com/api/webhooks/...' | sudo tee /etc/prometheus/discord-webhook >/dev/null
+sudo cp monitoring/alertmanager/alertmanager.yml /etc/prometheus/alertmanager.yml
+amtool check-config /etc/prometheus/alertmanager.yml
+```
+
+`FLUXGATE_EXPORTER_ENABLED=false` désactive l'exporteur. L'URL du webhook est un
+secret : elle reste hors du fichier de configuration. Les étapes complètes et le
+repli pour les Alertmanager anciens sont en tête de `alertmanager.yml`.
 
 ---
 
 ## Rollback complet
 
 ```bash
-sudo bash scripts/rollback.sh
+sudo fluxgate rollback        # ou : sudo bash scripts/rollback.sh
 sudo reboot
 ```
 
-Supprime toutes les configs (sysctl, modprobe, nginx, apache, fail2ban, action
-FluxGate, drop-in systemd), détache XDP, libère nftables.
+Supprime toutes les configs (sysctl, modprobe, nginx, apache, caddy, fail2ban,
+action FluxGate, drop-in systemd, timers, commande `fluxgate`, logrotate),
+détache XDP et supprime les tables FluxGate. Les fichiers système modifiés
+(dont `/etc/nftables.conf`) sont remis dans leur version d'avant FluxGate : le
+pare-feu ne revient plus au reboot. Les tables des autres outils ne sont pas
+touchées.
 
 ---
 
@@ -346,41 +465,52 @@ BRcloud-FluxGate/
 │   ├── validate.sh         # Validation de chaque couche
 │   ├── rollback.sh         # Restauration de l'état d'origine
 │   ├── status.sh           # Dashboard temps réel (-w)
+│   ├── migrate-config.sh   # Ajoute à config.env les clés manquantes
 │   ├── progress_bar.sh     # Barre de chargement native
 │   ├── config.env          # Configuration centralisée (non versionnée)
 │   └── lib/
+│       ├── defaults.sh     # Valeurs par défaut + chargement sûr de config.env
 │       ├── crs.sh          # Installation vérifiée de l'OWASP CRS
 │       └── nft-template.sh # Application de config.env dans nftables.conf
+├── cli/
+│   └── fluxgate            # Commande unique + menu gum/whiptail
 ├── nftables/
-│   ├── nftables.conf       # Règles dual-stack IPv4/IPv6 + SYNPROXY optionnel
-│   └── nft-manage.sh       # block / unblock / urgence / restore
+│   ├── nftables.conf       # Table inet fluxgate, dual-stack, SYNPROXY optionnel
+│   ├── nft-manage.sh       # ban / bouclier / urgence / restore
+│   ├── fluxgate-lists.sh   # Listes de réputation + plages CDN
+│   └── fluxgate-state.sh   # Sauvegarde / restauration des bans
 ├── nginx/
 │   ├── nginx-global.conf
 │   └── nginx-fluxgate.conf
+├── caddy/
+│   ├── fluxgate.caddy      # Snippets (base + Coraza/ratelimit)
+│   └── build-caddy.sh      # Compilation xcaddy avec les modules
 ├── apache/
 │   └── security-hardening.conf
 ├── sysctl/
 │   └── 99-fluxgate-hardening.conf
-├── systemd/
-│   ├── fluxgate-app.socket
-│   ├── fluxgate-web.service.d/resource-limits.conf
-│   └── fluxgate-xdp-autoblock.service
+├── systemd/                # Socket, limites, XDP, état, listes, exporteur
 ├── fail2ban/
 │   ├── action.d/fluxgate-nft.conf   # Ban dans les sets FluxGate
 │   ├── filter.d/
 │   └── jail.d/
 ├── waf/modsecurity/
 ├── crowdsec/
+├── logrotate/
+│   └── fluxgate            # /var/log/fluxgate + journaux ModSecurity
 ├── monitoring/
+│   ├── exporter/           # fluxgate-exporter.sh (textfile collector)
 │   ├── prometheus/         # Config + règles d'alerte
+│   ├── alertmanager/       # Routage vers Discord
 │   └── grafana/            # Dashboard + provisioning
 ├── xdp/
 │   ├── xdp-manage.sh       # Gestion filtres eBPF
-│   └── xdp-auto-block.sh   # Auto-ban via conntrack
+│   └── xdp-auto-block.sh   # Auto-ban via conntrack (TTL, liste blanche)
 ├── tc/
-│   └── tc-shape.sh         # Traffic shaping
+│   └── tc-shape.sh         # fq maxrate / cake
 ├── tests/
-│   └── test-templating.sh  # Tests du rendu nftables
+│   ├── test-templating.sh  # Tests du rendu nftables
+│   └── test-runtime.sh     # netns + trafic, nginx -t, fail2ban-regex, caddy
 └── docs/
     ├── architecture.md
     ├── documentation-complete.md
@@ -393,15 +523,27 @@ BRcloud-FluxGate/
 
 ```bash
 bash tests/test-templating.sh                  # tests de rendu
+sudo bash tests/test-runtime.sh                # tests d'exécution (root)
 shellcheck --severity=warning scripts/*.sh     # analyse statique
 sudo nft -c -f nftables/nftables.conf          # syntaxe du pare-feu
 ```
+
+`test-runtime.sh` ne modifie pas le pare-feu de la machine. Il charge le
+ruleset dans des espaces de noms réseau isolés, relie un « client » et un
+« serveur » par une paire veth, puis vérifie le trafic réel : HTTP passe, SSH
+est refusé hors `ADMIN_NETS` en mode strict et accepté depuis `ADMIN_NETS`, une
+IP bannie est coupée, l'urgence coupe et `restore` rouvre. Il teste aussi
+nft-manage, l'exporteur et la commande `fluxgate`, fait un `nginx -t` des
+rendus HTTP et HTTPS, passe les filtres fail2ban dans `fail2ban-regex`, valide
+le profil Caddy et vérifie `check-config.sh`. Un outil absent fait sauter sa
+section ; `FLUXGATE_TEST_STRICT=1` (utilisé en CI) en fait un échec.
 
 Depuis un poste Windows, WSL suffit pour tout sauf SYNPROXY :
 
 ```bash
 wsl -d Debian -u root -- bash -c 'cd /mnt/c/chemin/vers/BRcloud-FluxGate && \
-  nft -c -f nftables/nftables.conf && bash tests/test-templating.sh'
+  nft -c -f nftables/nftables.conf && bash tests/test-templating.sh && \
+  bash tests/test-runtime.sh'
 ```
 
 > Le noyau WSL2 ne fournit pas le module `nft_synproxy` : un rendu avec

@@ -1,0 +1,88 @@
+# =============================================================================
+# BRCloud FluxGate - Profil Caddy (snippets)
+# =============================================================================
+# Modele rendu par deploy.sh vers /etc/caddy/fluxgate.caddy : les valeurs
+# __XXX__ viennent de config.env. Ne pas modifier le fichier installe, il
+# est reecrit a chaque deploiement.
+#
+# Utilisation dans /etc/caddy/Caddyfile (apres le bloc d'options globales
+# s'il existe) :
+#
+#   import /etc/caddy/fluxgate.caddy
+#
+#   exemple.fr {
+#       import fluxgate
+#       reverse_proxy 127.0.0.1:8080
+#   }
+#
+# Snippets :
+#   fluxgate_base   en-tetes, taille de requete, methodes, journal JSON.
+#                   Fonctionne avec le Caddy des depots.
+#   fluxgate_waf    Coraza + OWASP CRS et limite de debit par client.
+#                   Necessite les modules coraza-caddy et caddy-ratelimit
+#                   (caddy/build-caddy.sh) ; deploy.sh le retire de
+#                   "fluxgate" si le binaire installe ne les a pas.
+#   fluxgate        les deux.
+# =============================================================================
+
+(fluxgate_base) {
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Strict-Transport-Security "__HSTS__"
+		-Server
+	}
+
+	request_body {
+		max_size 10MB
+	}
+
+	# Methodes autorisees : ALLOWED_METHODS
+	@fluxgate_bad_method not method __ALLOWED_METHODS__
+	respond @fluxgate_bad_method 405
+
+	# Journal JSON lu par CrowdSec (collection crowdsecurity/caddy).
+	# Caddy fait tourner ce fichier lui-meme.
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 100MiB
+			roll_keep 10
+		}
+		format json
+	}
+}
+
+(fluxgate_waf) {
+	# route : ordre explicite, sans directive "order" dans les options
+	# globales. Le WAF passe avant la limite de debit pour que les requetes
+	# malveillantes soient refusees sans consommer le quota du client.
+	route {
+		coraza_waf {
+			load_owasp_crs
+			directives `
+				Include @coraza.conf-recommended
+				Include @crs-setup.conf.example
+				Include @owasp_crs/*.conf
+				SecRuleEngine On
+				SecAuditEngine RelevantOnly
+				SecAuditLog /var/log/caddy/coraza_audit.log
+			`
+		}
+
+		# Equivalent de NGINX_REQ_PER_SEC + NGINX_BURST sur 10 secondes.
+		# Cle : __CLIENT_KEY_DOC__
+		rate_limit {
+			zone fluxgate_client {
+				key __CLIENT_KEY__
+				events __RATE_EVENTS__
+				window 10s
+			}
+		}
+	}
+}
+
+(fluxgate) {
+	import fluxgate_base
+	import fluxgate_waf
+}

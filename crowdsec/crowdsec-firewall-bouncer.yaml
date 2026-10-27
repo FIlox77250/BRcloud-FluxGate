@@ -17,7 +17,9 @@
 mode: nftables
 
 # --- API CrowdSec locale ---
-api_url: http://127.0.0.1:8080/
+# Port CROWDSEC_LAPI_PORT (8081 par defaut) : 8080, le defaut de CrowdSec,
+# est aussi celui de l'application derriere NGINX (NGINX_UPSTREAM_PORT).
+api_url: http://127.0.0.1:8081/
 api_key: <CROWDSEC_BOUNCER_API_KEY>
 
 # --- Intervalle de mise a jour des decisions ---

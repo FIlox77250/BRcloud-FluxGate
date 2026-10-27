@@ -1,0 +1,24 @@
+# =============================================================================
+# BRCloud FluxGate - XDP au demarrage
+# =============================================================================
+# Un programme XDP ne survit pas a un reboot : ce service le rattache et
+# rejoue les bans non expires notes dans /var/lib/fluxgate/xdp-bans.
+# Active par deploy.sh quand XDP_ENABLED=true.
+# =============================================================================
+
+[Unit]
+Description=BRCloud FluxGate - XDP filter (chargement + restauration des bans)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/fluxgate/xdp/xdp-manage.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=FLUXGATE_CONFIG=/opt/fluxgate/scripts/config.env
+ExecStart=/opt/fluxgate/xdp/xdp-manage.sh restore
+ExecStop=/opt/fluxgate/xdp/xdp-manage.sh unload
+SyslogIdentifier=fluxgate-xdp
+
+[Install]
+WantedBy=multi-user.target

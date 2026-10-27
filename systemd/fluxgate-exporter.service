@@ -1,0 +1,15 @@
+# =============================================================================
+# BRCloud FluxGate - Exporteur de metriques (textfile collector)
+# =============================================================================
+# Lance chaque minute par fluxgate-exporter.timer.
+# =============================================================================
+
+[Unit]
+Description=FluxGate - metriques pour node_exporter (textfile collector)
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fluxgate/monitoring/exporter/fluxgate-exporter.sh
+Nice=10
+NoNewPrivileges=true

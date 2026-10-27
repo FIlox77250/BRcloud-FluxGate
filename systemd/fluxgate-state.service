@@ -1,0 +1,21 @@
+# =============================================================================
+# BRCloud FluxGate - Bans et listes persistants
+# =============================================================================
+# Restaure les bans (avec leur temps restant) et les listes de reputation/CDN
+# apres chaque chargement du pare-feu, et sauvegarde les bans avant chaque
+# arret. PartOf= le lie aux arrets/redemarrages de nftables.service.
+# =============================================================================
+[Unit]
+Description=BRCloud FluxGate - persistance des bans et des listes
+After=nftables.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/fluxgate/nftables/fluxgate-state.sh restore
+ExecReload=/opt/fluxgate/nftables/fluxgate-state.sh restore
+ExecStop=/opt/fluxgate/nftables/fluxgate-state.sh save
+
+[Install]
+WantedBy=nftables.service

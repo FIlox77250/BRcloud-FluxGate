@@ -9,11 +9,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/config.env"
+CONFIG_FILE="${FLUXGATE_CONFIG:-${SCRIPT_DIR}/config.env}"
 
+# shellcheck source=lib/defaults.sh
+source "${SCRIPT_DIR}/lib/defaults.sh"
 if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    fluxgate_load_config "$CONFIG_FILE" || exit 1
+else
+    fluxgate_apply_defaults
 fi
 
 IFACE="${IFACE:-eth0}"
@@ -40,6 +43,17 @@ while [[ $# -gt 0 ]]; do
         *) shift ;;
     esac
 done
+
+# set_size <set> : nombre d'elements d'un set de inet fluxgate. L'ancien
+# "grep -c ... || echo 0" affichait "0 0" (grep -c imprime deja 0 en
+# echouant) et ne comptait pas les bans sans timeout.
+set_size() {
+    nft list set inet fluxgate "$1" 2>/dev/null \
+        | awk '/elements = \{/ {f = 1} f {print} f && /\}/ {exit}' \
+        | tr -d '\n' \
+        | sed -n 's/.*elements = {\(.*\)}.*/\1/p' \
+        | awk -F, '{print NF} END {if (NR == 0) print 0}'
+}
 
 print_status() {
     echo ""
@@ -101,26 +115,33 @@ fi
 echo ""
 
 # --- nftables ---
-echo -e "${CYAN}=== nftables ===${NC}"
-if command -v nft &>/dev/null; then
-    CHAINS=$(nft list chains 2>/dev/null | grep -c "chain" || echo 0)
-    echo "  Chains actives : $CHAINS"
-
-    # Compteur de drops
-    DROP_COUNT=$(nft list chain inet filter input 2>/dev/null | grep -oP 'packets \K[0-9]+' | tail -1 || echo "N/A")
-    echo "  Drops (last counter) : $DROP_COUNT packets"
-
-    # IPs bloquees
-    BLOCKED=$(nft list set inet filter blocklist4 2>/dev/null | grep -c "expires" || echo 0)
-    echo "  IPs bloquees (blocklist4) : $BLOCKED"
-else
+echo -e "${CYAN}=== nftables (table inet fluxgate) ===${NC}"
+if ! command -v nft &>/dev/null; then
     echo "  nft non disponible"
+elif ! nft list table inet fluxgate &>/dev/null; then
+    echo -e "  Table : ${RED}ABSENTE${NC} (pare-feu FluxGate non charge)"
+else
+    echo -e "  Table : ${GREEN}chargee${NC}"
+    # Somme des compteurs des regles "drop" et "reject" de la chaine input
+    DROP_COUNT=$(nft list chain inet fluxgate input 2>/dev/null \
+        | awk '/counter packets/ && /drop|reject/ {for (i = 1; i < NF; i++) if ($i == "packets") s += $(i+1)} END {print s + 0}')
+    echo "  Paquets rejetes (regles avec compteur) : $DROP_COUNT"
+    echo "  Bans IPv4 : $(set_size blocklist4)   IPv6 : $(set_size blocklist6)   IPv6 /64 : $(set_size blocklist6net)"
+    echo "  Reputation : $(set_size reputation4) reseau(x) v4, $(set_size reputation6) v6"
+    if nft list chain inet fluxgate shield 2>/dev/null | grep -q 'Shield'; then
+        echo -e "  Bouclier : ${YELLOW}ACTIF${NC}"
+    else
+        echo "  Bouclier : inactif"
+    fi
+fi
+if command -v nft &>/dev/null && nft list table inet fluxgate_emergency &>/dev/null; then
+    echo -e "  ${RED}MODE URGENCE ACTIF${NC} (nft-manage.sh restore pour en sortir)"
 fi
 echo ""
 
 # --- Services ---
 echo -e "${CYAN}=== Services ===${NC}"
-for svc in nftables nginx apache2 fail2ban crowdsec; do
+for svc in nftables fluxgate-state nginx apache2 fail2ban crowdsec crowdsec-firewall-bouncer fluxgate-xdp; do
     if systemctl is-active "$svc" &>/dev/null; then
         echo -e "  $svc : ${GREEN}actif${NC}"
     elif systemctl is-enabled "$svc" &>/dev/null; then

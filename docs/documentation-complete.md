@@ -1,12 +1,68 @@
 # BRCloud FluxGate - Documentation Complete
 
 > Stack anti-DDoS open-source pour serveur Linux (Debian/Ubuntu, RHEL/Fedora).
-> Version : 1.0 | Derniere mise a jour : 2026-02-14
+> Version : 2.1 | Derniere mise a jour : 2026-10-26
+
+> **Lire d'abord la section [0. Changements depuis la v1](#0-changements-depuis-la-v1).**
+> Le corps de ce document a ete ecrit pour la v1. Les passages devenus faux
+> (`flush ruleset`, table `inet filter`, limites globales, journaux
+> `auth.log`, `CPUQuota=80%`, TBF) sont listes en section 0 avec leur
+> remplacement. En cas de doute, le README et `CHANGELOG.md` font foi.
+
+---
+
+## 0. Changements depuis la v1
+
+### v2.0 : SYNPROXY, IPv6, BBR
+
+- **IPv6 complet.** Chaque set et chaque regle existe en IPv4 et en IPv6
+  (`blocklist6`, `admin6`, `ADMIN_NETS6`). En v1, `ADMIN_NETS` etait IPv4
+  seulement : un administrateur connecte en IPv6 se bloquait en mode strict.
+- **SYNPROXY optionnel** (`SYNPROXY_ENABLED`, `SYNPROXY_MSS`,
+  `SYNPROXY_WSCALE`). Le noyau repond lui-meme au handshake TCP des ports web
+  et ne cree l'entree conntrack qu'apres un ACK valide : un SYN flood usurpe
+  ne remplit plus la table. Necessite `nf_conntrack_tcp_loose=0`,
+  `tcp_syncookies=1` et `tcp_timestamps=1` (fournis par le sysctl FluxGate)
+  et le module `nft_synproxy`. A tester hors production : un MSS ou un
+  WSCALE faux degrade le trafic web.
+- **BBR + fq** par defaut (`TCP_CONGESTION_CONTROL=bbr`). Repasser a `cubic`
+  / `fq_codel` si le noyau ne fournit pas `tcp_bbr`. `validate.sh` verifie
+  l'algorithme actif.
+- `config.env` est enfin applique en entier (ports, seuils, reseaux admin) ;
+  en v1 une partie des valeurs restait celle du modele.
+
+### v2.1 : revue d'octobre 2026
+
+| Sujet | v1 (sections 6, 8, 13, 14, 15, 16, 19, 21) | Maintenant |
+|-------|--------------------------------------------|------------|
+| Table nftables | `flush ruleset` + `table inet filter` : effacait aussi Docker, CrowdSec, wg-quick | table dediee `inet fluxgate`, seule supprimee et recreee. Commandes : remplacer `inet filter` par `inet fluxgate` |
+| Limites | SYN HTTP et SSH **globales** : 50 SYN/s usurpes coupaient le site | toutes **par IP**, par **/64** en IPv6 (`NFT_HTTP_SYN_RATE`, `NFT_SSH_RATE`, `NFT_HTTP_CONN_LIMIT`) |
+| ICMPv6 | ND et RA dans le seau des pings | ND, RA, Packet Too Big sans limite ; seul `echo-request` limite |
+| Anti-lockout | rollback `at` annule apres 3 s | jeton a confirmer depuis une **nouvelle** session SSH sous 120 s ; `at` en dernier recours |
+| `nft-manage.sh apply` | chargeait le modele brut (port 22) | recharge `/etc/nftables.conf` rendu, bans conserves |
+| Journaux SSH | `/var/log/auth.log` (absent sur Debian 12/13) | journal systemd (`backend = systemd`, source `journalctl`) |
+| systemd | `CPUQuota=80%` = 80 % d'**un** coeur | `SVC_CPU_QUOTA=auto` (nproc x 80 %) |
+| tc | TBF, remplacait le `fq` requis par BBR | `cake` ou `fq maxrate` (`TC_QDISC`) |
+| Urgence | jusqu'a `restore` | `emergency-drop-all --for 15m` revient seul ; nouveau niveau intermediaire `shield on --for 30m` |
+| Port CrowdSec LAPI | 8080, en conflit avec l'amont NGINX | `CROWDSEC_LAPI_PORT=8081` |
+
+Nouveautes de la v2.1, detaillees dans le README :
+
+- commande `fluxgate` (menu gum / whiptail) et `deploy.sh --dry-run`,
+  `--diff`, `--yes` ;
+- `EXTRA_TCP_PORTS` / `EXTRA_UDP_PORTS`, liste blanche `ALLOWLIST4/6`,
+  listes de reputation (`REPUTATION_LISTS`), `CDN_MODE=cloudflare` ;
+- profil Caddy (`caddy/`, Coraza + caddy-ratelimit) ;
+- exporteur FluxGate pour node_exporter et Alertmanager vers Discord ;
+- persistance des bans et de XDP au reboot ; logrotate ;
+- `validate.sh` actif (SQLi -> 403, rafale -> 429) ;
+- `tests/test-runtime.sh` (netns, `nginx -t`, `fail2ban-regex`, `caddy validate`).
 
 ---
 
 ## Table des matieres
 
+0. [Changements depuis la v1](#0-changements-depuis-la-v1)
 1. [Presentation generale](#1-presentation-generale)
 2. [Architecture et flux d'un paquet](#2-architecture-et-flux-dun-paquet)
 3. [Arborescence du projet](#3-arborescence-du-projet)
@@ -676,7 +732,8 @@ ip6 saddr @blocklist6 counter drop
 
 Ajouter une IP manuellement :
 ```bash
-nft add element inet filter blocklist4 '{ 203.0.113.50 timeout 2h }'
+nft add element inet fluxgate blocklist4 '{ 203.0.113.50 timeout 2h }'
+# ou, plus simple : sudo fluxgate ban 203.0.113.50 2h
 ```
 
 #### Connexions etablies
@@ -1693,13 +1750,16 @@ ssh -L 9090:127.0.0.1:9090 user@192.168.0.X
 Ajouter une regle nftables temporaire (perdue au reboot) :
 ```bash
 # Grafana depuis le LAN uniquement
-sudo nft add rule inet filter input ip saddr 192.168.0.0/24 tcp dport 3000 accept
+sudo nft insert rule inet fluxgate input ip saddr 192.168.0.0/24 tcp dport 3000 accept
 
 # Prometheus depuis le LAN uniquement (optionnel)
-sudo nft add rule inet filter input ip saddr 192.168.0.0/24 tcp dport 9090 accept
+sudo nft insert rule inet fluxgate input ip saddr 192.168.0.0/24 tcp dport 9090 accept
 ```
 
-Pour rendre la regle permanente, ajouter dans `nftables/nftables.conf` avant le compteur final de la chain input :
+Ne pas utiliser `EXTRA_TCP_PORTS` pour ces ports : il les ouvre a tout
+Internet. Pour un acces permanent depuis une machine de confiance, la placer
+dans `ALLOWLIST4` (attention : l'allowlist ouvre **tous** les ports a ces
+adresses). Pour une regle plus fine, ajouter dans `nftables/nftables.conf` avant le compteur final de la chain input, puis re-deployer :
 ```
 # --- Monitoring : acces LAN uniquement ---
 tcp dport { 3000, 9090, 9100 } ip saddr 192.168.0.0/24 accept comment "Monitoring LAN only"
@@ -1949,7 +2009,9 @@ curl -s http://127.0.0.1:3000/api/health
 ### Perte d'acces SSH
 
 1. Se connecter via la **console KVM/VNC** de l'hebergeur.
-2. Flush les regles : `nft flush ruleset`.
+2. Retirer le pare-feu FluxGate : `nft delete table inet fluxgate` (et
+   `nft delete table inet fluxgate_emergency` si l'urgence etait active).
+   Eviter `nft flush ruleset`, qui efface aussi Docker, CrowdSec, etc.
 3. Diagnostiquer pourquoi SSH est bloque (`nft list ruleset`, `fail2ban-client status sshd`).
 4. Corriger et re-deployer.
 
